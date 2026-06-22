@@ -1,0 +1,56 @@
+{
+    "model": {
+        "out_channel_M": 96,
+        "out_channel_N": 64,
+        "num_refinement_blocks": 3,
+        "residual_scale": 0.1
+    },
+    "training": {
+        "epochs": 600,
+        "batch_size": 1,
+        "learning_rate": 0.0001,
+        "weight_decay": 0.00001,
+        "gradient_clip": 1.0,
+        "optimizer": "Adam",
+        "scheduler": {
+            "type": "ReduceLROnPlateau",
+            "mode": "min",
+            "factor": 0.5,
+            "patience": 5
+        }
+    },
+    "curriculum": {
+        "phase_1_epochs": [0, 200],
+        "phase_2_epochs": [200, 400],
+        "phase_3_epochs": [400, 600],
+        "phase_1_depth": 4,
+        "phase_2_depth": "random",
+        "phase_3_depth": "random"
+    },
+    "loss": {
+        "weights": [1.0, 0.9, 0.8, 0.7],
+        "mse_weight": 1.0,
+        "bitrate_weight": 0.01
+    },
+    "data": {
+        "train_root": "data/vimeo90k",
+        "test_root": "data/uvg",
+        "sequence_length": 8,
+        "train_stride": 4,
+        "test_stride": 8,
+        "resize_h": 256,
+        "crop_h": 256
+    },
+    "logging": {
+        "log_interval": 100,
+        "val_interval": 1000,
+        "checkpoint_interval": 5000,
+        "log_dir": "logs",
+        "checkpoint_dir": "checkpoints"
+    },
+    "evaluation": {
+        "num_latency_runs": 20,
+        "warmup_runs": 5,
+        "test_depths": [1, 2, 3, 4]
+    }
+}

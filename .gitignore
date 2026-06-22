@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual Environments
+venv/
+env/
+.env
+
+# Jupyter Notebooks
+.ipynb_checkpoints/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+
+# Deep Learning / Data
+data/
+datasets/
+logs/
+checkpoints/
+runs/
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.onnx
+
+# Video / Images / Binaries
+*.yuv
+*.mp4
+*.avi
+*.mkv
+*.png
+*.jpg
+*.jpeg
+*.bin
+*.tar
+*.zip
+*.gz
+
+# OS generated files
+.DS_Store
+Thumbs.db
