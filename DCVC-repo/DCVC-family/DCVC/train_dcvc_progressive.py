@@ -270,10 +270,10 @@ class Trainer:
         self.best_val_psnr = state.get('val_psnr', 0.0)
         self.model.progressive_decoder.load_state_dict(state['progressive_decoder_state'])
         
-        if 'optimizer' in state:
-            self.optimizer.load_state_dict(state['optimizer'])
-        if 'scheduler' in state:
-            self.scheduler.load_state_dict(state['scheduler'])
+        if 'optimizer_state' in state:
+            self.optimizer.load_state_dict(state['optimizer_state'])
+        if 'scheduler_state' in state:
+            self.scheduler.load_state_dict(state['scheduler_state'])
             
         print(f"  Resumed at epoch {self.start_epoch}. Best PSNR: {self.best_val_psnr:.2f} dB")
 
@@ -425,6 +425,7 @@ class Trainer:
             'progressive_decoder_state': self.model.progressive_decoder.state_dict(),
             'full_model_state':  self.model.state_dict(),
             'optimizer_state':   self.optimizer.state_dict(),
+            'scheduler_state':   self.scheduler.state_dict(),
         }, path)
         print(f"  Saved checkpoint: {path}")
 
