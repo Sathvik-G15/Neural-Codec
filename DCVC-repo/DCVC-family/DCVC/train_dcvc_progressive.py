@@ -225,14 +225,15 @@ class Trainer:
         val_ds   = Vimeo90kDataset(args.data_root, list_file='sep_testlist.txt',  patch_size=args.patch_size)
 
         # DataLoader: Disable pin_memory on Kaggle to prevent CPU RAM explosions 
-        # (Docker containers have limited /dev/shm shared memory).
+        # Set num_workers=0 to prevent Kaggle Docker Deadlocks. When reading thousands
+        # of images, Kaggle's multiprocessing often silently freezes.
         self.train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                       shuffle=True,  num_workers=2, pin_memory=False,
+                                       shuffle=True,  num_workers=0, pin_memory=False,
                                        drop_last=True)
         # Limit validation to 100 random pairs per epoch to speed it up
         # (Vimeo90k test set is massive, we don't need to eval all of it every epoch)
         self.val_loader   = DataLoader(val_ds,   batch_size=1,
-                                       shuffle=True, num_workers=2, pin_memory=False)
+                                       shuffle=True, num_workers=0, pin_memory=False)
 
         # ── Logging ────────────────────────────────────────────────────────
         self.writer   = SummaryWriter(args.log_dir)
