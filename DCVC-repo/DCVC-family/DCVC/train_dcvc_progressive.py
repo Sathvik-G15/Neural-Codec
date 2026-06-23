@@ -282,12 +282,6 @@ class Trainer:
     def _is_warmup(self, epoch: int) -> bool:
         return epoch < self.args.warmup_epochs
 
-    def _choose_depth(self, epoch: int) -> int | None:
-        """Warmup: full quality only. After: random depth per batch."""
-        if self._is_warmup(epoch):
-            return None   # all tiers
-        return random.randint(1, self.model.progressive_decoder.num_refinement_blocks + 1)
-
     # ------------------------------------------------------------------
 
     def train_one_epoch(self, epoch: int) -> dict:
@@ -301,7 +295,7 @@ class Trainer:
         total_loss = total_psnr = 0.0
         n = 0
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]")
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]", mininterval=10.0)
         for ref, cur in pbar:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
@@ -347,7 +341,7 @@ class Trainer:
         total_psnr = total_bpp = 0.0
         n = 0
 
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]")
+        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]", mininterval=10.0)
         for ref, cur in pbar:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
@@ -413,6 +407,8 @@ class Trainer:
 
     def _save(self, epoch: int, tag: str):
         path = self.ckpt_dir / f'progressive_{tag}.pth.tar'
+        temp_path = self.ckpt_dir / f'progressive_{tag}_temp.pth.tar'
+        
         torch.save({
             'epoch':             epoch,
             'val_psnr':          self.best_val_psnr,
@@ -420,7 +416,10 @@ class Trainer:
             'full_model_state':  self.model.state_dict(),
             'optimizer_state':   self.optimizer.state_dict(),
             'scheduler_state':   self.scheduler.state_dict(),
-        }, path)
+        }, temp_path)
+        
+        # Atomic rename prevents corrupted checkpoints if Kaggle kills the job during save
+        os.replace(temp_path, path)
         print(f"  Saved checkpoint: {path}")
 
 
