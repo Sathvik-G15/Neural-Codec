@@ -51,11 +51,17 @@ class Vimeo90kDataset(Dataset):
     """Yields consecutive frame pairs (ref, current) from Vimeo-90k septuplets."""
 
     def __init__(self, root: str, list_file: str, patch_size: int = 256):
-        self.root = Path(root) / 'vimeo_septuplet' / 'sequences'
+        base_dir = Path(root)
+        # Handle cases where the dataset is extracted flat (like in Kaggle) 
+        # or nested in 'vimeo_septuplet' (like the official zip)
+        if (base_dir / 'vimeo_septuplet').exists():
+            base_dir = base_dir / 'vimeo_septuplet'
+
+        self.root = base_dir / 'sequences'
         self.patch_size = patch_size
         self.sequences = []
         
-        list_path = Path(root) / 'vimeo_septuplet' / list_file
+        list_path = base_dir / list_file
         if list_path.exists():
             with open(list_path, 'r') as f:
                 self.sequences = [line.strip() for line in f if line.strip()]
