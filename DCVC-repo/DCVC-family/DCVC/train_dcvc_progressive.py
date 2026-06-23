@@ -36,6 +36,7 @@ import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 from PIL import Image
 import numpy as np
@@ -298,7 +299,8 @@ class Trainer:
         total_loss = total_psnr = 0.0
         n = 0
 
-        for ref, cur in self.train_loader:
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]")
+        for ref, cur in pbar:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
 
@@ -334,6 +336,10 @@ class Trainer:
             total_loss += metrics['loss'].item()
             total_psnr += metrics['psnr']
             n += 1
+            
+            # Update progress bar
+            if n % 10 == 0:
+                pbar.set_postfix({'loss': f"{total_loss/n:.4f}", 'psnr': f"{total_psnr/n:.2f}"})
 
         return {'loss': total_loss / n, 'psnr': total_psnr / n}
 
@@ -345,7 +351,8 @@ class Trainer:
         total_psnr = total_bpp = 0.0
         n = 0
 
-        for ref, cur in self.val_loader:
+        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]")
+        for ref, cur in pbar:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
             out = self.parallel_model(ref, cur)
