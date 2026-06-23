@@ -295,8 +295,9 @@ class Trainer:
         total_loss = total_psnr = 0.0
         n = 0
 
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch} [Train]", mininterval=10.0)
-        for ref, cur in pbar:
+        total_batches = len(self.train_loader)
+
+        for ref, cur in self.train_loader:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
 
@@ -326,10 +327,10 @@ class Trainer:
             total_loss += metrics['loss'].item()
             total_psnr += metrics['psnr']
             n += 1
-            
-            # Update progress bar
-            if n % 10 == 0:
-                pbar.set_postfix({'loss': f"{total_loss/n:.4f}", 'psnr': f"{total_psnr/n:.2f}"})
+            # Force standard print to Kaggle log every 1000 batches (bypassing Jupyter buffers)
+            if n % 1000 == 0:
+                print(f"  Epoch {epoch} [Train] Batch {n}/{total_batches} | "
+                      f"loss: {total_loss/n:.4f} | psnr: {total_psnr/n:.2f}", flush=True)
 
         return {'loss': total_loss / n, 'psnr': total_psnr / n}
 
@@ -341,8 +342,7 @@ class Trainer:
         total_psnr = total_bpp = 0.0
         n = 0
 
-        pbar = tqdm(self.val_loader, desc=f"Epoch {epoch} [Val]", mininterval=10.0)
-        for ref, cur in pbar:
+        for ref, cur in self.val_loader:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
             out = self.parallel_model(ref, cur)
