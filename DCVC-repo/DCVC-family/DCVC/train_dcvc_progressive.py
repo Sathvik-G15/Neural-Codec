@@ -183,6 +183,9 @@ class Trainer:
 
         # ── Model ──────────────────────────────────────────────────────────
         self.model = DCVC_net().to(self.device)
+        self.start_epoch = 0
+        
+        # Load Microsoft base weights first
         self._load_pretrained(args.pretrained)
         freeze_encoder_and_entropy(self.model)
 
@@ -198,6 +201,10 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=args.epochs, eta_min=1e-6,
         )
+
+        # ── Resume State ───────────────────────────────────────────────────
+        if args.resume:
+            self._load_resume(args.resume)
 
         # ── Data ───────────────────────────────────────────────────────────
         train_ds = Vimeo90kDataset(args.data_root, list_file='sep_trainlist.txt', patch_size=args.patch_size)
@@ -234,6 +241,25 @@ class Trainer:
                     break
         self.model.load_dict(state)
         print("  Pretrained weights loaded.")
+
+    # ------------------------------------------------------------------
+    
+    def _load_resume(self, resume_path: str):
+        if not Path(resume_path).exists():
+            print(f"  Resume checkpoint {resume_path} not found.")
+            return
+        print(f"  Resuming from checkpoint {resume_path}")
+        state = torch.load(resume_path, map_location=self.device, weights_only=True)
+        self.start_epoch = state['epoch'] + 1
+        self.best_val_psnr = state.get('val_psnr', 0.0)
+        self.model.progressive_decoder.load_state_dict(state['progressive_decoder_state'])
+        
+        if 'optimizer' in state:
+            self.optimizer.load_state_dict(state['optimizer'])
+        if 'scheduler' in state:
+            self.scheduler.load_state_dict(state['scheduler'])
+            
+        print(f"  Resumed at epoch {self.start_epoch}. Best PSNR: {self.best_val_psnr:.2f} dB")
 
     # ------------------------------------------------------------------
 
@@ -327,7 +353,7 @@ class Trainer:
         print(f"\nTraining for {args.epochs} epochs "
               f"({args.warmup_epochs} warmup, then full RD loss)\n")
 
-        for epoch in range(args.epochs):
+        for epoch in range(self.start_epoch, args.epochs):
             phase = 'warmup' if self._is_warmup(epoch) else 'train'
             train_metrics = self.train_one_epoch(epoch)
             val_metrics   = self.validate(epoch)
@@ -384,7 +410,9 @@ def parse_args():
     )
     p.add_argument('--pretrained',     type=str, default='',
                    help='Path to pretrained DCVC checkpoint (.pth.tar)')
-    p.add_argument('--data_root',      type=str, default=r'F:\Vimeo90k_Dataset',
+    p.add_argument('--resume',         type=str, default='',
+                   help='Path to progressive_best.pth.tar to resume training after a timeout')
+    p.add_argument('--data_root',      type=str, default='../../../DCVC-Scalable/data',
                    help='Directory containing the vimeo_septuplet/ folder')
     p.add_argument('--lambda_rd',      type=float, default=0.0483,
                    help='RD tradeoff weight. DCVC uses: 0.0483 | 0.0250 | 0.0130 | 0.0067')
