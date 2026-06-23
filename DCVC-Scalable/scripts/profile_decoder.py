@@ -13,7 +13,7 @@ import torch.nn as nn
 import sys
 sys.path.insert(0, 'src')
 
-from progressive_decoder import ProgressiveDecoder, RefinementBlock, GDN
+from progressive_decoder import ProgressiveContextualDecoder, RefinementBlock, GDN
 
 
 def count_flops_conv(m, H, W):
@@ -32,7 +32,7 @@ def profile_decoder_layers(decoder, spatial_dim=(64, 64)):
     """Profile each layer in the decoder.
 
     Args:
-        decoder:      ProgressiveDecoder instance
+        decoder:      ProgressiveContextualDecoder instance
         spatial_dim:  (H, W) of the *latent* tensor fed into the decoder.
 
     Returns:
@@ -56,13 +56,21 @@ def profile_decoder_layers(decoder, spatial_dim=(64, 64)):
     print("=" * 70)
 
     total_base_flops = 0
-    for name, module in decoder.base_decoder.named_modules():
+    for name, module in decoder.part1.named_modules():
         if len(list(module.children())) == 0:
             flops = count_flops_conv(module, lat_H, lat_W)
             if flops > 0:
-                results[f"base.{name}"] = flops
+                results[f"part1.{name}"] = flops
                 total_base_flops += flops
-                print(f"  {name:40s}: {flops:>12,} FLOPs")
+                print(f"  part1.{name:34s}: {flops:>12,} FLOPs")
+                
+    for name, module in decoder.part2.named_modules():
+        if len(list(module.children())) == 0:
+            flops = count_flops_conv(module, out_H, out_W)
+            if flops > 0:
+                results[f"part2.{name}"] = flops
+                total_base_flops += flops
+                print(f"  part2.{name:34s}: {flops:>12,} FLOPs")
 
     print(f"\n  TOTAL BASE DECODER: {total_base_flops:,} FLOPs")
 
@@ -93,9 +101,8 @@ def profile_decoder_layers(decoder, spatial_dim=(64, 64)):
                 ref_block_flops += count_flops_conv(module, out_H, out_W)
         block_flops += ref_block_flops
 
-        # out layer: Conv2d(N → 3, 1×1)
         # out layer: Conv2d(N -> 3, 1x1)
-        out_conv   = decoder.refinement_out[i]
+        out_conv   = decoder.refinement_outs[i]
         out_flops  = count_flops_conv(out_conv, out_H, out_W)
         block_flops += out_flops
 
@@ -113,14 +120,14 @@ def compute_tier_flops(decoder, layer_results, spatial_dim=(64, 64)):
     """Compute cumulative FLOPs per compute tier.
 
     Args:
-        decoder:       ProgressiveDecoder instance
+        decoder:       ProgressiveContextualDecoder instance
         layer_results: Output from profile_decoder_layers
         spatial_dim:   (H, W) of latent (used only for display)
 
     Returns:
         dict {tier_index: cumulative_flops}
     """
-    base_flops = sum(v for k, v in layer_results.items() if k.startswith('base'))
+    base_flops = sum(v for k, v in layer_results.items() if k.startswith('part'))
 
     # Tier 1 = base only; each subsequent tier adds one refinement block
     tiers = {1: base_flops}
@@ -148,7 +155,7 @@ def profile_with_thop(decoder, input_shape=(1, 96, 64, 64)):
     """Profile using the thop library for PyTorch-accurate FLOPs.
 
     Args:
-        decoder:      ProgressiveDecoder instance
+        decoder:      ProgressiveContextualDecoder instance
         input_shape:  Shape of latent input tensor
     """
     from thop import profile as thop_profile
@@ -170,7 +177,7 @@ def main():
     print("DCVC PROGRESSIVE DECODER PROFILING")
     print("=" * 70)
 
-    decoder = ProgressiveDecoder(
+    decoder = ProgressiveContextualDecoder(
         out_channel_M=96,
         out_channel_N=64,
         num_refinement_blocks=3
@@ -205,7 +212,7 @@ def main():
     print(f"  Latent spatial: {spatial_dim[0]}×{spatial_dim[1]}  |  "
           f"Output spatial: {spatial_dim[0]*8}×{spatial_dim[1]*8}  (8× upsample)\n")
 
-    base_total = sum(v for k, v in layer_results.items() if k.startswith('base'))
+    base_total = sum(v for k, v in layer_results.items() if k.startswith('part'))
     ref_ea     = layer_results.get('refinement_0', 0)
     max_flops  = tier_flops[max(tier_flops)]
 
@@ -213,8 +220,8 @@ def main():
     print(f"  {'Module':<{col_w}} | {'FLOPs':>14} | {'% of Base':>10}")
     print(f"  {'-'*col_w}-+-{'-'*14}-+-{'-'*10}")
     for name, flops in layer_results.items():
-        if name.startswith('base'):
-            short = name.replace('base.', '')
+        if name.startswith('part'):
+            short = name
             print(f"  {short:<{col_w}} | {flops:>14,} | {100*flops/base_total:>8.1f}%")
     print(f"  {'-'*col_w}-+-{'-'*14}-+-{'-'*10}")
     print(f"  {'Base Decoder (total)':<{col_w}} | {base_total:>14,} |   100.0%")
