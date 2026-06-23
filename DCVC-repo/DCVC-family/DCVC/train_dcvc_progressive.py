@@ -195,6 +195,13 @@ class Trainer:
         self._load_pretrained(args.pretrained)
         freeze_encoder_and_entropy(self.model)
 
+        # Wrap in DataParallel to use both T4 GPUs on Kaggle
+        if torch.cuda.device_count() > 1:
+            print(f"  Using {torch.cuda.device_count()} GPUs with DataParallel!")
+            self.parallel_model = nn.DataParallel(self.model)
+        else:
+            self.parallel_model = self.model
+
         # ── Loss ───────────────────────────────────────────────────────────
         self.loss_fn_warmup = ProgressiveLoss(lambda_rd=args.lambda_rd, use_rate=False)
         self.loss_fn_train  = ProgressiveLoss(lambda_rd=args.lambda_rd, use_rate=True)
@@ -306,15 +313,17 @@ class Trainer:
                 # ONLY the decoder with gradients.)
 
             # Re-run decoder with gradients enabled
-            # Extract intermediate tensors from the full forward
-            # We need to run forward again with grad on the decoder only
-            # Since all encoder params have requires_grad=False, PyTorch
-            # will not store encoder activations in the graph.
-            out = self.model(ref, cur)
+            out = self.parallel_model(ref, cur)
             recon_images = out['recon_images']
-            bpp          = out['bpp']
+            bpp_val = out['bpp']
+            
+            # DataParallel might return a list or stacked tensor
+            if isinstance(bpp_val, torch.Tensor):
+                bpp_val = bpp_val.mean()
+            elif isinstance(bpp_val, list):
+                bpp_val = sum(bpp_val) / len(bpp_val)
 
-            metrics = loss_fn(recon_images, cur, bpp)
+            metrics = loss_fn(recon_images, cur, bpp_val)
             metrics['loss'].backward()
 
             nn.utils.clip_grad_norm_(
@@ -339,14 +348,19 @@ class Trainer:
         for ref, cur in self.val_loader:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
-            out = self.model(ref, cur)
+            out = self.parallel_model(ref, cur)
             recon_images = out['recon_images']
 
             mse  = nn.functional.mse_loss(recon_images[-1], cur).item()
             psnr = 10 * np.log10(1.0 / (mse + 1e-8))
             total_psnr += psnr
-            total_bpp  += out['bpp'].item() if isinstance(out['bpp'], torch.Tensor) \
-                          else out['bpp']
+            
+            bpp_val = out['bpp']
+            if isinstance(bpp_val, torch.Tensor):
+                bpp_val = bpp_val.mean().item()
+            elif isinstance(bpp_val, list):
+                bpp_val = sum(bpp_val) / len(bpp_val)
+            total_bpp += bpp_val
             if n >= 100:  # Early stop validation to save time (Vimeo90k test set is large)
                 break
 
