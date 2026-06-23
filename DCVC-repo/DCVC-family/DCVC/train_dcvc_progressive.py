@@ -308,15 +308,9 @@ class Trainer:
 
             self.optimizer.zero_grad()
 
-            with torch.no_grad():
-                # Run frozen encoder path — get latent & context
-                out_full = self.model(ref, cur)
-                # Re-use context and latent for the trainable decoder
-                # (forward() already ran the progressive decoder, but with
-                # gradients disabled for frozen parts. We need to re-run
-                # ONLY the decoder with gradients.)
-
-            # Re-run decoder with gradients enabled
+            # Forward pass through DataParallel model
+            # PyTorch automatically disables gradient tracking for the frozen 
+            # encoder/entropy parts and tracks gradients ONLY for the decoder.
             out = self.parallel_model(ref, cur)
             recon_images = out['recon_images']
             bpp_val = out['bpp']
