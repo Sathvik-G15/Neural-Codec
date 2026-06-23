@@ -121,7 +121,7 @@ class BaseDecoder(nn.Module):
         return x
 
 
-class ProgressiveDecoder(nn.Module):
+class ProgressiveContextualDecoder(nn.Module):
     """Progressive residual decoder for compute-scalable video decoding.
 
     Architecture (as per research plan §2):
@@ -188,9 +188,9 @@ class ProgressiveDecoder(nn.Module):
         # Progressive refinement in 64-channel feature space
         current_features = features
         for i in range(depth - 1):
-            # Residual refinement in feature space (plan §2.3: 64 channels)
+            # Residual refinement in feature space (RefinementBlock applies 0.1 scale and skip connection)
             refined_features = self.refinement_blocks[i](current_features)
-            current_features = current_features + 0.1 * refined_features
+            current_features = refined_features
             # Project to RGB for output
             rgb = self.tier_projections[i + 1](current_features)
             rgb = torch.clamp(rgb, 0.0, 1.0)
@@ -198,47 +198,7 @@ class ProgressiveDecoder(nn.Module):
 
         return outputs
 
-    def get_flops_per_stage(self, latent_shape):
-        """Estimate cumulative FLOPs for each decode stage.
 
-        Args:
-            latent_shape: (B, C, H_lat, W_lat) of the latent (H/16, W/16)
-
-        Returns:
-            List of cumulative FLOPs: [base, base+R1, ..., base+R1+...+R3]
-        """
-        B, C, H_lat, W_lat = latent_shape
-        H_full = H_lat * 16
-        W_full = W_lat * 16
-
-        base_flops = 0
-        for m in self.base_decoder.modules():
-            if isinstance(m, nn.Conv2d):
-                kH, kW = m.kernel_size
-                out_h = (H_full // 16) if 'stage1' in str(type(m)) else H_full
-                # Use appropriate spatial dimension per stage
-                if 'stage1' in [n for n, _ in self.base_decoder.named_modules()]:
-                    h, w = H_lat * 2, W_lat * 2   # H/8
-                elif 'stage2' in str(type(m)):
-                    h, w = H_lat * 4, W_lat * 4   # H/4
-                elif 'stage3' in str(type(m)):
-                    h, w = H_lat * 8, W_lat * 8   # H/2
-                else:
-                    h, w = H_full, W_full          # H
-                base_flops += m.in_channels * m.out_channels * kH * kW * h * w
-
-        ref_flops = 0
-        if self.num_refinement_blocks > 0:
-            for m in self.refinement_blocks[0].modules():
-                if isinstance(m, nn.Conv2d):
-                    kH, kW = m.kernel_size
-                    ref_flops += m.in_channels * m.out_channels * kH * kW * H_full * W_full
-
-        tier_flops = [base_flops]
-        for _ in range(self.num_refinement_blocks):
-            tier_flops.append(tier_flops[-1] + ref_flops)
-
-        return tier_flops
 
     def extra_repr(self):
         return (f'out_channel_M={self.out_channel_M}, '
