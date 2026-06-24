@@ -98,8 +98,9 @@ class Vimeo90kDataset(Dataset):
     @staticmethod
     def _load(path: Path) -> torch.Tensor:
         try:
-            img = Image.open(path).convert('RGB')
-            arr = np.array(img, dtype=np.float32) / 255.0
+            with Image.open(path) as img:
+                img_rgb = img.convert('RGB')
+                arr = np.array(img_rgb, dtype=np.float32) / 255.0
             return torch.from_numpy(arr).permute(2, 0, 1)
         except Exception:
             # Fallback for missing files during download
@@ -356,8 +357,10 @@ class Trainer:
             if isinstance(bpp_val, torch.Tensor):
                 bpp_val = bpp_val.mean().item()
             elif isinstance(bpp_val, list):
-                bpp_val = sum(bpp_val) / len(bpp_val)
+                bpp_val = sum(v.mean().item() if isinstance(v, torch.Tensor) else v for v in bpp_val) / len(bpp_val)
             total_bpp += bpp_val
+            
+            n += 1
             if n >= 100:  # Early stop validation to save time (Vimeo90k test set is large)
                 break
 
