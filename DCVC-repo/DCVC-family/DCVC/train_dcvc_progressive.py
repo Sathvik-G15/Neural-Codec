@@ -29,6 +29,8 @@ import os
 import sys
 import argparse
 import random
+import os
+import psutil
 from pathlib import Path
 
 import torch
@@ -328,10 +330,21 @@ class Trainer:
             total_loss += metrics['loss'].item()
             total_psnr += metrics['psnr']
             n += 1
+            
+            # Explicitly delete tensors to prevent any reference accumulation
+            del out
+            del recon_images
+            del bpp_val
+            del metrics
+
             # Force standard print to Kaggle log every 1000 batches (bypassing Jupyter buffers)
             if n % 1000 == 0:
+                process = psutil.Process(os.getpid())
+                ram_gb = process.memory_info().rss / 1024**3
+                gpu_gb = torch.cuda.memory_allocated(0) / 1024**3
                 print(f"  Epoch {epoch} [Train] Batch {n}/{total_batches} | "
-                      f"loss: {total_loss/n:.4f} | psnr: {total_psnr/n:.2f}", flush=True)
+                      f"loss: {total_loss/n:.4f} | psnr: {total_psnr/n:.2f} | "
+                      f"RAM: {ram_gb:.2f}GB | GPU: {gpu_gb:.2f}GB", flush=True)
 
         return {'loss': total_loss / n, 'psnr': total_psnr / n}
 
