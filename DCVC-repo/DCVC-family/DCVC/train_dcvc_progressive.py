@@ -119,34 +119,33 @@ class ProgressiveLoss(nn.Module):
 
     L = bpp  +  lambda_rd * sum_i(w_i * MSE(recon_i, target))
 
-    Weights [1.0, 0.9, 0.8, 0.7] prioritise early tiers during warm-up so
-    the base tier (Tier 1) already gives decent quality on its own.
+    Base weights [1.0, 0.9, 0.8, 0.7] prioritise early tiers so the base 
+    tier (Tier 1) provides strong initial quality. These weights are 
+    normalized to sum to 1.0 to ensure the overall gradient magnitude 
+    matches the original DCVC scaling for lambda_rd.
     """
-
-    TIER_WEIGHTS = [1.0, 0.9, 0.8, 0.7]
-    TIER_WEIGHTS = [w / sum(TIER_WEIGHTS) for w in TIER_WEIGHTS]
 
     def __init__(self, lambda_rd: float = 0.0483, use_rate: bool = True):
         super().__init__()
         self.lambda_rd = lambda_rd
         self.use_rate  = use_rate
         self.mse = nn.MSELoss()
+        
+        base_weights = [1.0, 0.9, 0.8, 0.7]
+        norm = sum(base_weights)
+        self.TIER_WEIGHTS = [w / norm for w in base_weights]
 
-    def forward(
-        self,
-        recon_images: list[torch.Tensor],
-        target: torch.Tensor,
-        bpp: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
+    def forward(self, recon_images, target, bpp):
+
         distortion = 0.0
+
         for i, recon in enumerate(recon_images):
             w = self.TIER_WEIGHTS[i] if i < len(self.TIER_WEIGHTS) else self.TIER_WEIGHTS[-1]
             distortion = distortion + w * self.mse(recon, target)
 
-        rate = bpp if self.use_rate else torch.tensor(0.0, device=target.device)
+        rate = bpp if self.use_rate else 0.0
         loss = rate + self.lambda_rd * distortion
 
-        # PSNR of best-quality tier
         mse_best = self.mse(recon_images[-1], target).item()
         psnr = 10 * np.log10(1.0 / (mse_best + 1e-8))
 
@@ -156,6 +155,7 @@ class ProgressiveLoss(nn.Module):
             'distortion': distortion.detach(),
             'psnr':       psnr,
         }
+
 
 
 # =============================================================================

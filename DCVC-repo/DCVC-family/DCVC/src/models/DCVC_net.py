@@ -456,42 +456,49 @@ class DCVC_net(nn.Module):
         return [r.clamp(0, 1) for r in recon_images]
 
     def forward(self, referframe, input_image):
-        estmv = self.opticFlow(input_image, referframe)
-        mvfeature = self.mvEncoder(estmv)
-        z_mv = self.mvpriorEncoder(mvfeature)
-        compressed_z_mv = torch.round(z_mv)
-        params_mv = self.mvpriorDecoder(compressed_z_mv)
+        with torch.no_grad():
+            estmv = self.opticFlow(input_image, referframe)
+            mvfeature = self.mvEncoder(estmv)
+            z_mv = self.mvpriorEncoder(mvfeature)
+            compressed_z_mv = torch.round(z_mv)
+            params_mv = self.mvpriorDecoder(compressed_z_mv)
 
-        quant_mv = torch.round(mvfeature)
+            quant_mv = torch.round(mvfeature)
 
-        ctx_params_mv = self.auto_regressive_mv(quant_mv)
-        gaussian_params_mv = self.entropy_parameters_mv(
-            torch.cat((params_mv, ctx_params_mv), dim=1)
-        )
-        means_hat_mv, scales_hat_mv = gaussian_params_mv.chunk(2, 1)
+            ctx_params_mv = self.auto_regressive_mv(quant_mv)
+            gaussian_params_mv = self.entropy_parameters_mv(
+                torch.cat((params_mv, ctx_params_mv), dim=1)
+            )
+            means_hat_mv, scales_hat_mv = gaussian_params_mv.chunk(2, 1)
 
-        quant_mv_upsample = self.mvDecoder_part1(quant_mv)
+            quant_mv_upsample = self.mvDecoder_part1(quant_mv)
 
-        quant_mv_upsample_refine = self.mv_refine(referframe, quant_mv_upsample)
+            quant_mv_upsample_refine = self.mv_refine(referframe, quant_mv_upsample)
 
-        context = self.motioncompensation(referframe, quant_mv_upsample_refine)
+            context = self.motioncompensation(referframe, quant_mv_upsample_refine)
 
-        temporal_prior_params = self.temporalPriorEncoder(context)
+            temporal_prior_params = self.temporalPriorEncoder(context)
 
-        feature = self.contextualEncoder(torch.cat((input_image, context), dim=1))
-        z = self.priorEncoder(feature)
-        compressed_z = torch.round(z)
-        params = self.priorDecoder(compressed_z)
+            feature = self.contextualEncoder(torch.cat((input_image, context), dim=1))
+            z = self.priorEncoder(feature)
+            compressed_z = torch.round(z)
+            params = self.priorDecoder(compressed_z)
 
-        feature_renorm = feature
+            feature_renorm = feature
 
-        compressed_y_renorm = torch.round(feature_renorm)
+            compressed_y_renorm = torch.round(feature_renorm)
 
-        ctx_params = self.auto_regressive(compressed_y_renorm)
-        gaussian_params = self.entropy_parameters(
-            torch.cat((temporal_prior_params, params, ctx_params), dim=1)
-        )
-        means_hat, scales_hat = gaussian_params.chunk(2, 1)
+            ctx_params = self.auto_regressive(compressed_y_renorm)
+            gaussian_params = self.entropy_parameters(
+                torch.cat((temporal_prior_params, params, ctx_params), dim=1)
+            )
+            means_hat, scales_hat = gaussian_params.chunk(2, 1)
+
+            total_bits_y, _ = self.feature_probs_based_sigma(
+                feature_renorm, means_hat, scales_hat)
+            total_bits_mv, _ = self.feature_probs_based_sigma(mvfeature, means_hat_mv, scales_hat_mv)
+            total_bits_z, _ = self.iclr18_estrate_bits_z(compressed_z)
+            total_bits_z_mv, _ = self.iclr18_estrate_bits_z_mv(compressed_z_mv)
 
         recon_image_feature = self.progressive_decoder.part1(compressed_y_renorm)
         x = self.progressive_decoder.part2(
@@ -506,12 +513,6 @@ class DCVC_net(nn.Module):
             x = torch.clamp(x, 0.0, 1.0)
             recon_images.append(x)
         recon_image = recon_images[-1]
-
-        total_bits_y, _ = self.feature_probs_based_sigma(
-            feature_renorm, means_hat, scales_hat)
-        total_bits_mv, _ = self.feature_probs_based_sigma(mvfeature, means_hat_mv, scales_hat_mv)
-        total_bits_z, _ = self.iclr18_estrate_bits_z(compressed_z)
-        total_bits_z_mv, _ = self.iclr18_estrate_bits_z_mv(compressed_z_mv)
 
         im_shape = input_image.size()
         pixel_num = im_shape[0] * im_shape[2] * im_shape[3]
@@ -529,7 +530,6 @@ class DCVC_net(nn.Module):
                 "bpp": bpp,
                 "recon_image": recon_image,
                 "recon_images": recon_images,   # all 4 tier outputs for deep supervision
-                "context": context,
                 }
 
     def load_dict(self, pretrained_dict):
