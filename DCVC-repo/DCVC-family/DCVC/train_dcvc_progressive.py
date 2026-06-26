@@ -318,8 +318,11 @@ class Trainer:
         total_batches = len(self.train_loader)
 
         for ref, cur in self.train_loader:
-            ref = ref.to(self.device, non_blocking=True).float().div_(255.0)
-            cur = cur.to(self.device, non_blocking=True).float().div_(255.0)
+            ref = ref.to(self.device, non_blocking=True)
+            cur = cur.to(self.device, non_blocking=True)
+            
+            ref = ref.to(dtype=torch.float32).mul_(1.0 / 255.0)
+            cur = cur.to(dtype=torch.float32).mul_(1.0 / 255.0)
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -387,8 +390,12 @@ class Trainer:
         n = 0
 
         for ref, cur in self.val_loader:
-            ref = ref.to(self.device, non_blocking=True).float().div_(255.0)
-            cur = cur.to(self.device, non_blocking=True).float().div_(255.0)
+            ref = ref.to(self.device, non_blocking=True)
+            cur = cur.to(self.device, non_blocking=True)
+            
+            ref = ref.to(dtype=torch.float32).mul_(1.0 / 255.0)
+            cur = cur.to(dtype=torch.float32).mul_(1.0 / 255.0)
+            
             out = self.parallel_model(ref, cur)
             recon_images = out['recon_images']
 
