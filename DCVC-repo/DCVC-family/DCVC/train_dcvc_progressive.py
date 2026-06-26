@@ -202,12 +202,9 @@ class Trainer:
         self._load_pretrained(args.pretrained)
         freeze_encoder_and_entropy(self.model)
 
-        # Wrap in DataParallel to use both T4 GPUs on Kaggle
-        if torch.cuda.device_count() > 1:
-            print(f"  Using {torch.cuda.device_count()} GPUs with DataParallel!")
-            self.parallel_model = nn.DataParallel(self.model)
-        else:
-            self.parallel_model = self.model
+        # Force single GPU execution to prevent CPU memory accumulation
+        # from DataParallel scatter/gather graph retention on Kaggle
+        self.parallel_model = self.model
 
         # ── Loss ───────────────────────────────────────────────────────────
         self.loss_fn_warmup = ProgressiveLoss(lambda_rd=args.lambda_rd, use_rate=False)
