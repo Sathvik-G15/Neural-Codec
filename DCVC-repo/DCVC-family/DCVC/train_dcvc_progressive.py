@@ -100,10 +100,11 @@ class Vimeo90kDataset(Dataset):
     @staticmethod
     def _load(path: Path) -> torch.Tensor:
         try:
-            with Image.open(path) as img:
-                img_rgb = img.convert('RGB')
-                arr = np.array(img_rgb, dtype=np.float32) / 255.0
-            return torch.from_numpy(arr).permute(2, 0, 1)
+            import torchvision.io as io
+            # read_image returns uint8 tensor of shape [C, H, W]
+            # Bypasses PIL and Numpy entirely, avoiding glibc fragmentation leaks!
+            tensor = io.read_image(str(path))
+            return tensor.float() / 255.0
         except Exception:
             # Fallback for missing files during download
             return torch.zeros(3, 256, 256)
