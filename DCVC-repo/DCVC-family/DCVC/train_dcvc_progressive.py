@@ -230,16 +230,27 @@ class Trainer:
         train_ds = Vimeo90kDataset(args.data_root, list_file='sep_trainlist.txt', patch_size=args.patch_size)
         val_ds   = Vimeo90kDataset(args.data_root, list_file='sep_testlist.txt',  patch_size=args.patch_size)
 
-        # DataLoader: Disable pin_memory on Kaggle to prevent CPU RAM explosions 
-        # Set num_workers=0 to prevent Kaggle Docker Deadlocks. When reading thousands
-        # of images, Kaggle's multiprocessing often silently freezes.
-        self.train_loader = DataLoader(train_ds, batch_size=args.batch_size,
-                                       shuffle=True,  num_workers=0, pin_memory=False,
-                                       drop_last=True)
+        # DataLoader: Use 2 workers with spawn+file_system to bypass Kaggle memory
+        # fragmentation and /dev/shm exhaustion. Keep pin_memory=False for safety.
+        self.train_loader = DataLoader(
+            train_ds,
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=False,
+            persistent_workers=True,
+            prefetch_factor=2,
+            drop_last=True
+        )
         # Limit validation to 100 random pairs per epoch to speed it up
-        # (Vimeo90k test set is massive, we don't need to eval all of it every epoch)
-        self.val_loader   = DataLoader(val_ds,   batch_size=1,
-                                       shuffle=True, num_workers=0, pin_memory=False)
+        self.val_loader = DataLoader(
+            val_ds,
+            batch_size=1,
+            shuffle=True,
+            num_workers=1,
+            pin_memory=False,
+            persistent_workers=True
+        )
 
         # ── Logging ────────────────────────────────────────────────────────
         self.writer   = SummaryWriter(args.log_dir)
@@ -345,6 +356,7 @@ class Trainer:
             del recon_images
             del bpp_val
             del metrics
+            del ref, cur
 
             # Force standard print to Kaggle log every 1000 batches (bypassing Jupyter buffers)
             if n % 1000 == 0:
@@ -494,7 +506,12 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    import torch.multiprocessing as mp
+    mp.set_start_method("spawn", force=True)
+    mp.set_sharing_strategy("file_system")
+
     torch.backends.cudnn.benchmark = True
+    
     args = parse_args()
     trainer = Trainer(args)
     trainer.run()
