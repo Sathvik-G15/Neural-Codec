@@ -32,6 +32,12 @@ import argparse
 import random
 import psutil
 from pathlib import Path
+import ctypes
+
+try:
+    libc = ctypes.CDLL("libc.so.6")
+except Exception:
+    libc = None
 
 import torch
 import torch.nn as nn
@@ -72,6 +78,7 @@ class Vimeo90kDataset(Dataset):
             print(f"Warning: {list_path} not found. Ensure Vimeo-90k is downloaded.")
 
         print(f"  Dataset ({list_file}): {len(self.sequences)} sequences.")
+        self.reads = 0
 
     def __len__(self):
         return len(self.sequences)
@@ -95,6 +102,11 @@ class Vimeo90kDataset(Dataset):
             x0 = random.randint(0, W - ps)
             ref = ref[:, y0:y0+ps, x0:x0+ps]
             cur = cur[:, y0:y0+ps, x0:x0+ps]
+            
+        self.reads += 1
+        if self.reads % 1000 == 0 and libc is not None:
+            libc.malloc_trim(0)
+            
         return ref, cur
 
     @staticmethod
