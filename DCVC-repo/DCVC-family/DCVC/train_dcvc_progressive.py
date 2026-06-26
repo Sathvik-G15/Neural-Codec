@@ -78,7 +78,6 @@ class Vimeo90kDataset(Dataset):
             print(f"Warning: {list_path} not found. Ensure Vimeo-90k is downloaded.")
 
         print(f"  Dataset ({list_file}): {len(self.sequences)} sequences.")
-        self.reads = 0
 
     def __len__(self):
         return len(self.sequences)
@@ -103,9 +102,12 @@ class Vimeo90kDataset(Dataset):
             ref = ref[:, y0:y0+ps, x0:x0+ps]
             cur = cur[:, y0:y0+ps, x0:x0+ps]
             
-        self.reads += 1
-        if self.reads % 1000 == 0 and libc is not None:
-            libc.malloc_trim(0)
+        if libc is not None:
+            if random.randint(0, 199) == 0:   # check ~0.5% of samples
+                process = psutil.Process(os.getpid())
+                rss_gb = process.memory_info().rss / (1024**3)
+                if rss_gb > 8.5:   # threshold slightly above steady state
+                    libc.malloc_trim(0)
             
         return ref, cur
 
