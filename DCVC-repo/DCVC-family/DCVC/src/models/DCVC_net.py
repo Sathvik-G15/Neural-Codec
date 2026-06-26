@@ -190,7 +190,16 @@ class DCVC_net(nn.Module):
         outputs += means
         return outputs
 
+    @torch.no_grad()
     def feature_probs_based_sigma(self, feature, mean, sigma):
+        """Estimate rate (total bits) from a Laplace entropy model.
+
+        Decorated with @no_grad because:
+          - inputs come from quantized (torch.round) or frozen-encoder tensors
+          - the returned `probs` tensor is always discarded by callers (_)
+          - no gradient path to progressive_decoder params exists here
+        Avoids building a large autograd graph for `probs` on every forward pass.
+        """
         outputs = self.quantize(
             feature, "dequantize", mean
         )
@@ -202,11 +211,13 @@ class DCVC_net(nn.Module):
         total_bits = torch.sum(torch.clamp(-1.0 * torch.log(probs + 1e-5) / math.log(2.0), 0, 50))
         return total_bits, probs
 
+    @torch.no_grad()  # bitEstimator_z is frozen; prob is always discarded by callers
     def iclr18_estrate_bits_z(self, z):
         prob = self.bitEstimator_z(z + 0.5) - self.bitEstimator_z(z - 0.5)
         total_bits = torch.sum(torch.clamp(-1.0 * torch.log(prob + 1e-5) / math.log(2.0), 0, 50))
         return total_bits, prob
 
+    @torch.no_grad()  # bitEstimator_z_mv is frozen; prob is always discarded by callers
     def iclr18_estrate_bits_z_mv(self, z_mv):
         prob = self.bitEstimator_z_mv(z_mv + 0.5) - self.bitEstimator_z_mv(z_mv - 0.5)
         total_bits = torch.sum(torch.clamp(-1.0 * torch.log(prob + 1e-5) / math.log(2.0), 0, 50))

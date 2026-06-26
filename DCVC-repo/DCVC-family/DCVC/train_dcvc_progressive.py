@@ -25,11 +25,11 @@ Phase 1  (epochs 50-299) : Freeze encoder/entropy/motion, train decoder,
                            random depth each batch, full RD loss.
 """
 
+import gc
 import os
 import sys
 import argparse
 import random
-import os
 import psutil
 from pathlib import Path
 
@@ -339,12 +339,20 @@ class Trainer:
 
             # Force standard print to Kaggle log every 1000 batches (bypassing Jupyter buffers)
             if n % 1000 == 0:
-                process = psutil.Process(os.getpid())
-                ram_gb = process.memory_info().rss / 1024**3
-                gpu_gb = torch.cuda.memory_allocated(0) / 1024**3
+                # Actively release Python-side garbage and defragment the CUDA
+                # allocator pool before checking memory stats.
+                gc.collect()
+                torch.cuda.empty_cache()
+
+                process   = psutil.Process(os.getpid())
+                ram_gb    = process.memory_info().rss / 1024**3
+                gpu_alloc = torch.cuda.memory_allocated(0) / 1024**3
+                gpu_rsrv  = torch.cuda.memory_reserved(0)  / 1024**3  # allocator pool
                 print(f"  Epoch {epoch} [Train] Batch {n}/{total_batches} | "
                       f"loss: {total_loss/n:.4f} | psnr: {total_psnr/n:.2f} | "
-                      f"RAM: {ram_gb:.2f}GB | GPU: {gpu_gb:.2f}GB", flush=True)
+                      f"RAM: {ram_gb:.2f}GB | "
+                      f"GPU alloc: {gpu_alloc:.2f}GB / reserved: {gpu_rsrv:.2f}GB",
+                      flush=True)
 
         return {'loss': total_loss / n, 'psnr': total_psnr / n}
 
@@ -372,7 +380,11 @@ class Trainer:
             elif isinstance(bpp_val, list):
                 bpp_val = sum(v.mean().item() if isinstance(v, torch.Tensor) else v for v in bpp_val) / len(bpp_val)
             total_bpp += bpp_val
-            
+
+            # Free GPU tensors immediately — without this, each iteration holds two
+            # batches' worth of reconstruction tensors alive simultaneously.
+            del out, recon_images, ref, cur
+
             n += 1
             if n >= 100:  # Early stop validation to save time (Vimeo90k test set is large)
                 break
@@ -428,8 +440,13 @@ class Trainer:
         torch.save({
             'epoch':             epoch,
             'val_psnr':          self.best_val_psnr,
+            # Only save the trainable decoder + optimiser state.
+            # Saving the full frozen model via model.state_dict() causes a large
+            # CPU-RAM spike at every checkpoint (torch.save builds an in-memory
+            # copy before writing to disk). The full model can be reconstructed
+            # at resume time by loading the pretrained weights first, then
+            # overlaying progressive_decoder_state.
             'progressive_decoder_state': self.model.progressive_decoder.state_dict(),
-            'full_model_state':  self.model.state_dict(),
             'optimizer_state':   self.optimizer.state_dict(),
             'scheduler_state':   self.scheduler.state_dict(),
         }, temp_path)
