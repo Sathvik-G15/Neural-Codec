@@ -228,13 +228,13 @@ class Trainer:
         train_ds = Vimeo90kDataset(args.data_root, list_file='sep_trainlist.txt', patch_size=args.patch_size)
         val_ds   = Vimeo90kDataset(args.data_root, list_file='sep_testlist.txt',  patch_size=args.patch_size)
 
-        # DataLoader: Use 2 workers with spawn+file_system to bypass Kaggle memory
+        # DataLoader: Use 4 workers with spawn+file_system to bypass Kaggle memory
         # fragmentation and /dev/shm exhaustion. Keep pin_memory=False for safety.
         self.train_loader = DataLoader(
             train_ds,
             batch_size=args.batch_size,
             shuffle=True,
-            num_workers=2,
+            num_workers=4,
             pin_memory=False,
             persistent_workers=True,
             prefetch_factor=2,
@@ -502,7 +502,7 @@ def parse_args():
     p.add_argument('--epochs',         type=int, default=300)
     p.add_argument('--warmup_epochs',  type=int, default=50,
                    help='Epochs of MSE-only training before enabling rate loss')
-    p.add_argument('--batch_size',     type=int, default=2)
+    p.add_argument('--batch_size',     type=int, default=8)
     p.add_argument('--patch_size',     type=int, default=256)
     p.add_argument('--lr',             type=float, default=1e-4)
     p.add_argument('--log_dir',        type=str, default='runs/progressive')
