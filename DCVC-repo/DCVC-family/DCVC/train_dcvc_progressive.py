@@ -124,6 +124,7 @@ class ProgressiveLoss(nn.Module):
     """
 
     TIER_WEIGHTS = [1.0, 0.9, 0.8, 0.7]
+    TIER_WEIGHTS = [w / sum(TIER_WEIGHTS) for w in TIER_WEIGHTS]
 
     def __init__(self, lambda_rd: float = 0.0483, use_rate: bool = True):
         super().__init__()
@@ -137,9 +138,9 @@ class ProgressiveLoss(nn.Module):
         target: torch.Tensor,
         bpp: torch.Tensor,
     ) -> dict[str, torch.Tensor]:
-        distortion = torch.tensor(0.0, device=target.device)
+        distortion = 0.0
         for i, recon in enumerate(recon_images):
-            w = self.TIER_WEIGHTS[i] if i < len(self.TIER_WEIGHTS) else 0.7
+            w = self.TIER_WEIGHTS[i] if i < len(self.TIER_WEIGHTS) else self.TIER_WEIGHTS[-1]
             distortion = distortion + w * self.mse(recon, target)
 
         rate = bpp if self.use_rate else torch.tensor(0.0, device=target.device)
@@ -219,6 +220,7 @@ class Trainer:
         self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
             self.optimizer, T_max=args.epochs, eta_min=1e-6,
         )
+        self.scaler = torch.cuda.amp.GradScaler()
 
         # ── Resume State ───────────────────────────────────────────────────
         if args.resume:
@@ -278,6 +280,8 @@ class Trainer:
             self.optimizer.load_state_dict(state['optimizer_state'])
         if 'scheduler_state' in state:
             self.scheduler.load_state_dict(state['scheduler_state'])
+        if 'scaler_state' in state:
+            self.scaler.load_state_dict(state['scaler_state'])
             
         print(f"  Resumed at epoch {self.start_epoch}. Best PSNR: {self.best_val_psnr:.2f} dB")
 
@@ -305,28 +309,32 @@ class Trainer:
             ref = ref.to(self.device)
             cur = cur.to(self.device)
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
 
             # Forward pass through DataParallel model
             # PyTorch automatically disables gradient tracking for the frozen 
             # encoder/entropy parts and tracks gradients ONLY for the decoder.
-            out = self.parallel_model(ref, cur)
-            recon_images = out['recon_images']
-            bpp_val = out['bpp']
-            
-            # DataParallel might return a list or stacked tensor
-            if isinstance(bpp_val, torch.Tensor):
-                bpp_val = bpp_val.mean()
-            elif isinstance(bpp_val, list):
-                bpp_val = sum(bpp_val) / len(bpp_val)
+            with torch.autocast(device_type='cuda', dtype=torch.float16):
+                out = self.parallel_model(ref, cur)
+                recon_images = out['recon_images']
+                bpp_val = out['bpp']
+                
+                # DataParallel might return a list or stacked tensor
+                if isinstance(bpp_val, torch.Tensor):
+                    bpp_val = bpp_val.mean()
+                elif isinstance(bpp_val, list):
+                    bpp_val = sum(bpp_val) / len(bpp_val)
 
-            metrics = loss_fn(recon_images, cur, bpp_val)
-            metrics['loss'].backward()
+                metrics = loss_fn(recon_images, cur, bpp_val)
 
+            self.scaler.scale(metrics['loss']).backward()
+
+            self.scaler.unscale_(self.optimizer)
             nn.utils.clip_grad_norm_(
                 self.model.progressive_decoder.parameters(), max_norm=1.0
             )
-            self.optimizer.step()
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
 
             total_loss += metrics['loss'].item()
             total_psnr += metrics['psnr']
@@ -450,6 +458,7 @@ class Trainer:
             'progressive_decoder_state': self.model.progressive_decoder.state_dict(),
             'optimizer_state':   self.optimizer.state_dict(),
             'scheduler_state':   self.scheduler.state_dict(),
+            'scaler_state':      self.scaler.state_dict(),
         }, temp_path)
         
         # Atomic rename prevents corrupted checkpoints if Kaggle kills the job during save
@@ -485,6 +494,7 @@ def parse_args():
 
 
 if __name__ == '__main__':
+    torch.backends.cudnn.benchmark = True
     args = parse_args()
     trainer = Trainer(args)
     trainer.run()
