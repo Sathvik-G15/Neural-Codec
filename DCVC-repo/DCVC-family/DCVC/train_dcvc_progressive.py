@@ -102,12 +102,10 @@ class Vimeo90kDataset(Dataset):
             ref = ref[:, y0:y0+ps, x0:x0+ps]
             cur = cur[:, y0:y0+ps, x0:x0+ps]
             
-        if libc is not None:
-            if random.randint(0, 199) == 0:   # check ~0.5% of samples
-                process = psutil.Process(os.getpid())
-                rss_gb = process.memory_info().rss / (1024**3)
-                if rss_gb > 8.5:   # threshold slightly above steady state
-                    libc.malloc_trim(0)
+        self._counter = getattr(self, "_counter", 0) + 1
+        
+        if libc is not None and self._counter % 200 == 0:
+            libc.malloc_trim(0)
             
         return ref, cur
 
