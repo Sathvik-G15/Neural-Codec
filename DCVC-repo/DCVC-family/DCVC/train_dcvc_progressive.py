@@ -103,7 +103,7 @@ class Vimeo90kDataset(Dataset):
         try:
             with Image.open(str(path)) as img:
                 img = img.convert('RGB')
-                arr = np.asarray(img)
+                arr = np.array(img, copy=True)
             tensor = torch.from_numpy(arr).permute(2, 0, 1)
             return tensor
         except Exception:
