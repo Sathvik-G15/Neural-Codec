@@ -32,12 +32,6 @@ import argparse
 import random
 import psutil
 from pathlib import Path
-import ctypes
-
-try:
-    libc = ctypes.CDLL("libc.so.6")
-except Exception:
-    libc = None
 
 import torch
 import torch.nn as nn
@@ -102,21 +96,16 @@ class Vimeo90kDataset(Dataset):
             ref = ref[:, y0:y0+ps, x0:x0+ps]
             cur = cur[:, y0:y0+ps, x0:x0+ps]
             
-        self._counter = getattr(self, "_counter", 0) + 1
-        
-        if libc is not None and self._counter % 200 == 0:
-            libc.malloc_trim(0)
-            
         return ref, cur
 
     @staticmethod
     def _load(path: Path) -> torch.Tensor:
         try:
-            import torchvision.io as io
-            # read_image returns uint8 tensor of shape [C, H, W]
-            # Bypasses PIL and Numpy entirely, avoiding glibc fragmentation leaks!
-            tensor = io.read_image(str(path))
-            return tensor.float() / 255.0
+            with Image.open(str(path)) as img:
+                img = img.convert('RGB')
+                arr = np.asarray(img)
+            tensor = torch.from_numpy(arr).permute(2, 0, 1)
+            return tensor
         except Exception:
             # Fallback for missing files during download
             return torch.zeros(3, 256, 256)
@@ -329,8 +318,8 @@ class Trainer:
         total_batches = len(self.train_loader)
 
         for ref, cur in self.train_loader:
-            ref = ref.to(self.device)
-            cur = cur.to(self.device)
+            ref = ref.to(self.device, non_blocking=True).float().div_(255.0)
+            cur = cur.to(self.device, non_blocking=True).float().div_(255.0)
 
             self.optimizer.zero_grad(set_to_none=True)
 
@@ -398,8 +387,8 @@ class Trainer:
         n = 0
 
         for ref, cur in self.val_loader:
-            ref = ref.to(self.device)
-            cur = cur.to(self.device)
+            ref = ref.to(self.device, non_blocking=True).float().div_(255.0)
+            cur = cur.to(self.device, non_blocking=True).float().div_(255.0)
             out = self.parallel_model(ref, cur)
             recon_images = out['recon_images']
 
