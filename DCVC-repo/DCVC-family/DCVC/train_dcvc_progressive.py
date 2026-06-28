@@ -19,9 +19,9 @@ Usage
 
 Training strategy
 -----------------
-Phase 0  (epochs 0-49)   : Freeze ALL, train decoder ONLY, depth=4 fixed,
+Phase 0  (epochs 0-24)   : Freeze ALL, train decoder ONLY, depth=4 fixed,
                            MSE loss only (no rate term) — decoder alignment.
-Phase 1  (epochs 50-299) : Freeze encoder/entropy/motion, train decoder,
+Phase 1  (epochs 25-299) : Freeze encoder/entropy/motion, train decoder,
                            random depth each batch, full RD loss.
 """
 
@@ -138,13 +138,18 @@ class ProgressiveLoss(nn.Module):
 
     def forward(self, recon_images, target, bpp):
 
-        distortion = 0.0
+        if self.use_rate:
+            # RD phase → supervise only final produced tier
+            distortion = self.mse(recon_images[-1], target)
+            rate = bpp
+        else:
+            # Warmup phase → deep supervision
+            distortion = 0.0
+            for i, recon in enumerate(recon_images):
+                w = self.TIER_WEIGHTS[i] if i < len(self.TIER_WEIGHTS) else self.TIER_WEIGHTS[-1]
+                distortion += w * self.mse(recon, target)
+            rate = 0.0
 
-        for i, recon in enumerate(recon_images):
-            w = self.TIER_WEIGHTS[i] if i < len(self.TIER_WEIGHTS) else self.TIER_WEIGHTS[-1]
-            distortion = distortion + w * self.mse(recon, target)
-
-        rate = bpp if self.use_rate else 0.0
         loss = rate + self.lambda_rd * distortion
 
         mse_best = self.mse(recon_images[-1], target).item()
@@ -263,7 +268,7 @@ class Trainer:
             print("  No pretrained checkpoint — training from scratch (not recommended).")
             return
         print(f"  Loading pretrained weights from {ckpt_path}")
-        state = torch.load(ckpt_path, map_location=self.device, weights_only=True)
+        state = torch.load(ckpt_path, map_location=self.device, weights_only=False)
         # Handle 'state_dict' / 'model_state_dict' wrappers
         if isinstance(state, dict):
             for key in ('state_dict', 'model_state_dict', 'model'):
@@ -280,7 +285,7 @@ class Trainer:
             print(f"  Resume checkpoint {resume_path} not found.")
             return
         print(f"  Resuming from checkpoint {resume_path}")
-        state = torch.load(resume_path, map_location=self.device, weights_only=True)
+        state = torch.load(resume_path, map_location=self.device, weights_only=False)
         self.start_epoch = state['epoch'] + 1
         self.best_val_psnr = state.get('val_psnr', 0.0)
         self.model.progressive_decoder.load_state_dict(state['progressive_decoder_state'])
@@ -327,7 +332,18 @@ class Trainer:
             # PyTorch automatically disables gradient tracking for the frozen 
             # encoder/entropy parts and tracks gradients ONLY for the decoder.
             with torch.autocast(device_type='cuda', dtype=torch.float16):
+                if not self._is_warmup(epoch):
+                    # Random depth sampling during RD phase (biased towards deeper tiers)
+                    depth = random.choices(
+                        range(1, self.model.progressive_decoder.num_refinement_blocks + 2),
+                        weights=[1, 1, 2, 3]
+                    )[0]
+                    self.model._current_depth = depth
+                else:
+                    self.model._current_depth = None
+
                 out = self.parallel_model(ref, cur)
+                self.model._current_depth = None
                 recon_images = out['recon_images']
                 bpp_val = out['bpp']
                 
@@ -361,11 +377,6 @@ class Trainer:
 
             # Force standard print to Kaggle log every 1000 batches (bypassing Jupyter buffers)
             if n % 1000 == 0:
-                # Actively release Python-side garbage and defragment the CUDA
-                # allocator pool before checking memory stats.
-                gc.collect()
-                torch.cuda.empty_cache()
-
                 process   = psutil.Process(os.getpid())
                 ram_gb    = process.memory_info().rss / 1024**3
                 gpu_alloc = torch.cuda.memory_allocated(0) / 1024**3
@@ -384,6 +395,7 @@ class Trainer:
     def validate(self, epoch: int) -> dict:
         self.model.eval()
         total_psnr = total_bpp = 0.0
+        tier_psnrs = None
         n = 0
 
         for ref, cur in self.val_loader:
@@ -395,6 +407,14 @@ class Trainer:
             
             out = self.parallel_model(ref, cur)
             recon_images = out['recon_images']
+            
+            if tier_psnrs is None:
+                tier_psnrs = [0.0] * len(recon_images)
+
+            for i, recon in enumerate(recon_images):
+                mse = nn.functional.mse_loss(recon, cur).item()
+                psnr_i = 10 * np.log10(1.0 / (mse + 1e-8))
+                tier_psnrs[i] += psnr_i
 
             mse  = nn.functional.mse_loss(recon_images[-1], cur).item()
             psnr = 10 * np.log10(1.0 / (mse + 1e-8))
@@ -415,7 +435,11 @@ class Trainer:
             if n >= 100:  # Early stop validation to save time (Vimeo90k test set is large)
                 break
 
-        return {'psnr': total_psnr / n, 'bpp': total_bpp / n}
+        metrics = {'psnr': total_psnr / n, 'bpp': total_bpp / n}
+        if tier_psnrs is not None:
+            for i, val in enumerate(tier_psnrs):
+                metrics[f'psnr_tier{i+1}'] = val / n
+        return metrics
 
     # ------------------------------------------------------------------
 
@@ -432,6 +456,11 @@ class Trainer:
 
             lr = self.optimizer.param_groups[0]['lr']
 
+            tier_str = ""
+            for k, v in val_metrics.items():
+                if k.startswith('psnr_tier'):
+                    tier_str += f"  {k}={v:.2f}"
+
             print(
                 f"Epoch {epoch:4d}/{args.epochs}  [{phase:6s}]  "
                 f"loss={train_metrics['loss']:.4f}  "
@@ -439,6 +468,7 @@ class Trainer:
                 f"val_psnr={val_metrics['psnr']:.2f}  "
                 f"val_bpp={val_metrics['bpp']:.4f}  "
                 f"lr={lr:.2e}"
+                f"{tier_str}"
             )
 
             # TensorBoard
@@ -447,6 +477,10 @@ class Trainer:
             self.writer.add_scalar('val/psnr',    val_metrics['psnr'],   epoch)
             self.writer.add_scalar('val/bpp',     val_metrics['bpp'],    epoch)
             self.writer.add_scalar('lr',          lr,                     epoch)
+            
+            for k, v in val_metrics.items():
+                if k.startswith('psnr_tier'):
+                    self.writer.add_scalar(f'val/{k}', v, epoch)
 
             # Checkpoint (best + periodic)
             if val_metrics['psnr'] > self.best_val_psnr:
@@ -500,7 +534,7 @@ def parse_args():
     p.add_argument('--lambda_rd',      type=float, default=0.0483,
                    help='RD tradeoff weight. DCVC uses: 0.0483 | 0.0250 | 0.0130 | 0.0067')
     p.add_argument('--epochs',         type=int, default=300)
-    p.add_argument('--warmup_epochs',  type=int, default=50,
+    p.add_argument('--warmup_epochs',  type=int, default=25,
                    help='Epochs of MSE-only training before enabling rate loss')
     p.add_argument('--batch_size',     type=int, default=8)
     p.add_argument('--patch_size',     type=int, default=256)

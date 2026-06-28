@@ -500,18 +500,11 @@ class DCVC_net(nn.Module):
             total_bits_z, _ = self.iclr18_estrate_bits_z(compressed_z)
             total_bits_z_mv, _ = self.iclr18_estrate_bits_z_mv(compressed_z_mv)
 
-        recon_image_feature = self.progressive_decoder.part1(compressed_y_renorm)
-        x = self.progressive_decoder.part2(
-            torch.cat((recon_image_feature, context), dim=1)
+        depth = getattr(self, "_current_depth", None)
+
+        recon_images = self.progressive_decoder(
+            compressed_y_renorm, context, depth=depth
         )
-        # Full progressive decode during training (deep supervision over all tiers)
-        recon_images = [x]
-        for i in range(self.progressive_decoder.num_refinement_blocks):
-            feat = self.progressive_decoder.refinement_projs[i](x)
-            feat = self.progressive_decoder.refinement_blocks[i](feat)
-            x = x + self.progressive_decoder.refinement_outs[i](feat)
-            x = torch.clamp(x, 0.0, 1.0)
-            recon_images.append(x)
         recon_image = recon_images[-1]
 
         im_shape = input_image.size()
