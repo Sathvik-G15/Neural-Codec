@@ -257,21 +257,21 @@ class ProgressiveTrainer:
 
     @torch.no_grad()
     def validate(self) -> dict:
-        self.model.eval()
-        tier_sums = None
+        saved_training = self.model.training
+        saved_depth = self.model._current_depth
+
+        self.model.train()
+        self.model._current_depth = None
+
+        tier_sums = [0.0] * 4
         n = 0
 
         for ref, cur in self.val_loader:
             ref = ref.to(self.device).float().div_(255.0)
             cur = cur.to(self.device).float().div_(255.0)
 
-            self.model._current_depth = None
             out = self.model(ref, cur)
-            self.model._current_depth = None
             recon_images = out["recon_images"]
-
-            if tier_sums is None:
-                tier_sums = [0.0] * len(recon_images)
 
             for i, r in enumerate(recon_images):
                 mse = F.mse_loss(r, cur).item()
@@ -280,7 +280,9 @@ class ProgressiveTrainer:
             if n >= self.args.val_max_pairs:
                 break
 
-        self.model.train()
+        self.model._current_depth = saved_depth
+        self.model.train(saved_training)
+
         if tier_sums is None:
             return {}
         return {f"psnr_t{i+1}_mean": s / max(n, 1) for i, s in enumerate(tier_sums)}
