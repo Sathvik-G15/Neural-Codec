@@ -73,7 +73,7 @@ DEPTH_BY_PHASE = {
 
 
 class DCVCProgressiveLoss(nn.Module):
-    def __init__(self, weights=(1.0, 0.9, 0.8, 0.7), lambda_rd=0.05):
+    def __init__(self, weights=(1.0, 1.0, 1.0, 1.0), lambda_rd=0.05):
         super().__init__()
         self.weights = list(weights)
         self.lambda_rd = lambda_rd
