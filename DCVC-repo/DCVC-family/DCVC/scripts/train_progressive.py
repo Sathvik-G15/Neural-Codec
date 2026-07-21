@@ -73,7 +73,7 @@ DEPTH_BY_PHASE = {
 
 
 class DCVCProgressiveLoss(nn.Module):
-    def __init__(self, weights=(1.0, 0.9, 0.8, 0.7), lambda_rd=1e-3):
+    def __init__(self, weights=(1.0, 0.9, 0.8, 0.7), lambda_rd=0.05):
         super().__init__()
         self.weights = list(weights)
         self.lambda_rd = lambda_rd
@@ -399,7 +399,7 @@ def parse_args():
                    help="Path to Microsoft DCVC baseline .pth.tar")
     p.add_argument("--data_root", type=str, required=True,
                    help="Path containing vimeo_septuplet/sequences/ and {sep_trainlist.txt, sep_testlist.txt}")
-    p.add_argument("--lambda_rd", type=float, default=1e-3,
+    p.add_argument("--lambda_rd", type=float, default=0.05,
                    help="Distortion weight. Start at 1e-3; raise to 2e-3 if gap < 0.2 dB after 5k-10k steps.")
     p.add_argument("--batch_size", type=int, default=4)
     p.add_argument("--patch_size", type=int, default=256)
