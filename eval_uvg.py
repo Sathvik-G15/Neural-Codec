@@ -5,9 +5,12 @@ import numpy as np
 from pathlib import Path
 import sys
 
-# Add DCVC repo to path
-sys.path.append(r"e:\Sathvik\programming\Research\DCVC-repo\DCVC-family\DCVC")
+DCVC_DIR = Path(__file__).parent / "DCVC-repo" / "DCVC-family" / "DCVC"
+sys.path.insert(0, str(DCVC_DIR))
 from src.models.DCVC_net import DCVC_net
+
+CHECKPOINT_DIR = DCVC_DIR / "checkpoints"
+UVG_DATA_DIR = Path(__file__).parent / "DCVC-Scalable" / "data" / "uvg"
 
 def _load_image(path):
     with Image.open(str(path)) as img:
@@ -20,21 +23,26 @@ def _load_image(path):
 def main():
     print("Loading base DCVC weights...")
     model = DCVC_net().cuda()
-    base_ckpt = torch.load(r"e:\Sathvik\programming\Research\DCVC-repo\DCVC-family\DCVC\checkpoints\extracted\model_dcvc_quality_3_psnr.pth", map_location='cuda', weights_only=False)
-    # If the base checkpoint has 'state_dict', use it
+    base_ckpt_path = CHECKPOINT_DIR / "model_dcvc_quality_3_psnr.pth"
+    if not base_ckpt_path.exists():
+        extracted = CHECKPOINT_DIR / "extracted" / "model_dcvc_quality_3_psnr.pth"
+        if extracted.exists():
+            base_ckpt_path = extracted
+    base_ckpt = torch.load(base_ckpt_path, map_location='cuda', weights_only=False)
     if 'state_dict' in base_ckpt:
         model.load_state_dict(base_ckpt['state_dict'], strict=False)
     else:
         model.load_state_dict(base_ckpt, strict=False)
         
     print("Loading progressive decoder checkpoint...")
-    prog_ckpt = torch.load(r"e:\Sathvik\programming\Research\DCVC-repo\DCVC-family\DCVC\checkpoints\progressive\progressive_best.pth.tar", map_location='cuda', weights_only=False)
+    prog_ckpt_path = CHECKPOINT_DIR / "progressive" / "progressive_best.pth.tar"
+    prog_ckpt = torch.load(prog_ckpt_path, map_location='cuda', weights_only=False)
     model.progressive_decoder.load_state_dict(prog_ckpt['progressive_decoder_state'])
-    
+
     model.eval()
-    
+
     print("Loading UVG Beauty sequence (first 2 frames)...")
-    uvg_dir = Path(r"e:\Sathvik\programming\Research\DCVC-Scalable\data\uvg\Beauty")
+    uvg_dir = UVG_DATA_DIR / "Beauty"
     pngs = sorted(list(uvg_dir.glob("*.png")))
     if len(pngs) < 2:
         print("Could not find enough PNGs in UVG Beauty directory.")

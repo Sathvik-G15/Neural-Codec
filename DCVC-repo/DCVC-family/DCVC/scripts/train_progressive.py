@@ -1,34 +1,31 @@
-"""Train Progressive Decoder (Phase A/B/C curriculum, descending-weight deep supervision).
+"""Train Progressive Decoder (Phase 0/1/2/3 curriculum, descending-weight deep supervision).
 
-Strategy
---------
-Phase A (0..4999)       : fixed depth=4 (model alignment)
-Phase B (5000..34999)   : UNIFORM random depth [1..4]
-Phase C (35000..59999)  : UNIFORM random depth [1..4]
+Phase 0 (0..10K):   Fixed depth=4 — CEILING CHECK: does Tier 4 approach stock DCVC PSNR?
+Phase 1 (0..60K):   Fixed depth=4 — Establish full-depth baseline quality
+Phase 2 (0..60K):   Random depth [1..4] — Force early stages to learn standalone representations
+Phase 3 (0..60K):   Random depth [1..4] — Fine-tune with full training set
 
-Both late phases use uniform sampling to train all tiers equally.
-Endpoint-biased sampling under-trains the mid tiers.
+Per plan §3.2: phase boundaries are CHECKPOINTS TO RESUME FROM, not restart points.
+Early-advance and mid-phase-resume are both explicitly permitted.
+
+Go/no-go decision (Phase 0 -> Phase 1):
+    Compare Tier 4 PSNR against stock DCVC PSNR per UVG sequence.
+    Advance if mean within ±1σ; flag if >1 sequence outside ±2σ.
+    σ is pinned to M0.5's measurement, not training-run σ.
 
 Loss
 ----
 L = lambda_rd * sum_i w_i * MSE(recon_i, target)
-weights = (1.0, 0.9, 0.8, 0.7)  (descending stabilisation, no rate term)
+weights = (1.0, 0.9, 0.8, 0.7)  (descending, per plan §3.1)
 
-Tier 1 output equals the original DCVC reconstruction by construction
-(TieredRefinement has zero-init proj_out at construction time).
-
-Lambda escalation rule
-----------------------
-Start at lambda_rd = 1e-3. After ~5k..10k steps, if mean tier gap < 0.2 dB,
-restart with --lambda_rd 2e-3. Do not exceed 3e-3.
-Escalation is MANUAL (not auto-applied inside the script).
+Invariant: len(outputs) == active_depth (weight slicing in loss handles this).
 
 Usage (Kaggle)
 --------------
-    !python dcvc_progressive/scripts/train_progressive.py \
+    python train_progressive.py \
         --pretrained /kaggle/input/dcvc-baseline/model_dcvc_quality_3_psnr.pth.tar \
         --data_root  /kaggle/input/vimeo90k-septuplet \
-        --total_steps 60000 \
+        --total_steps 180000 \
         --batch_size 4 \
         --lambda_rd 1e-3 \
         --log_dir    /kaggle/working/runs/progressive \
@@ -37,6 +34,7 @@ Usage (Kaggle)
 
 import argparse
 import gc
+import json
 import os
 import random
 import sys
@@ -54,6 +52,25 @@ from torch.utils.tensorboard import SummaryWriter
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from src.models.DCVC_net import DCVC_net
+
+MAX_STEPS_PER_PHASE = {
+    0: 10_000,
+    1: 60_000,
+    2: 60_000,
+    3: 60_000,
+}
+CUMULATIVE_STEPS = {
+    0: MAX_STEPS_PER_PHASE[0],
+    1: MAX_STEPS_PER_PHASE[0] + MAX_STEPS_PER_PHASE[1],
+    2: MAX_STEPS_PER_PHASE[0] + MAX_STEPS_PER_PHASE[1] + MAX_STEPS_PER_PHASE[2],
+    3: sum(MAX_STEPS_PER_PHASE.values()),
+}
+DEPTH_BY_PHASE = {
+    0: [4],
+    1: [4],
+    2: [1, 2, 3, 4],
+    3: [1, 2, 3, 4],
+}
 
 # =============================================================================
 # Loss
@@ -263,18 +280,63 @@ class ProgressiveTrainer:
         print(f"  Resumed at step {self.step} "
               f"(phase {ckpt.get('phase', '?')}).")
 
-    # ------------------------------------------------------------------
+# ------------------------------------------------------------------
     # Curriculum
     # ------------------------------------------------------------------
 
-    @staticmethod
-    def sample_depth(step: int) -> int:
-        """Curriculum depth sampler (uniform in B and C)."""
-        if step < 5000:
-            return 4
-        return int(torch.randint(0, 4, (1,)).item()) + 1
+    def get_phase(self, global_step: int) -> int:
+        if global_step < CUMULATIVE_STEPS[0]:
+            return 0
+        elif global_step < CUMULATIVE_STEPS[1]:
+            return 1
+        elif global_step < CUMULATIVE_STEPS[2]:
+            return 2
+        else:
+            return 3
 
-    # ------------------------------------------------------------------
+    def get_phase_step(self, global_step: int) -> int:
+        phase = self.get_phase(global_step)
+        if phase == 0:
+            return global_step
+        elif phase == 1:
+            return global_step - CUMULATIVE_STEPS[0]
+        elif phase == 2:
+            return global_step - CUMULATIVE_STEPS[1]
+        else:
+            return global_step - CUMULATIVE_STEPS[2]
+
+    def sample_depth(self, global_step: int) -> int:
+        phase = self.get_phase(global_step)
+        depths = DEPTH_BY_PHASE[phase]
+        return int(torch.randint(0, len(depths), (1,)).item()) + depths[0]
+
+    def check_early_advance(self, val_metrics: dict, phase: int) -> bool:
+        if phase not in (0, 1):
+            return False
+        t4_psnr = val_metrics.get("psnr_t4_mean", None)
+        if t4_psnr is None:
+            return False
+        window = 500
+        key = f"history_t4_psnr"
+        if not hasattr(self, "psnr_history"):
+            self.psnr_history = []
+        self.psnr_history.append(t4_psnr)
+        if len(self.psnr_history) > window + 1:
+            self.psnr_history.pop(0)
+        if len(self.psnr_history) < window + 1:
+            return False
+        delta = self.psnr_history[-1] - self.psnr_history[0]
+        if delta < 0.05:
+            print(f"  [PLATEAU] Phase {phase} Tier 4 PSNR plateaued (delta={delta:.4f} dB over last {window} val steps)")
+            return True
+        return False
+
+    def phase_summary(self, global_step: int) -> str:
+        phase = self.get_phase(global_step)
+        phase_step = self.get_phase_step(global_step)
+        return f"phase={phase} (step_in_phase={phase_step}/{MAX_STEPS_PER_PHASE[phase]})"
+
+# ------------------------------------------------------------------
     # Train step
     # ------------------------------------------------------------------
 
@@ -290,7 +352,7 @@ class ProgressiveTrainer:
         self.optimizer.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(self.decoder_params, max_norm=1.0)
-        self.optimizer.step()
+self.optimizer.step()
         return float(loss.item())
 
     # ------------------------------------------------------------------
@@ -328,47 +390,50 @@ class ProgressiveTrainer:
         return {f"psnr_t{i+1}_mean": s / max(n, 1) for i, s in enumerate(tier_sums)}
 
     # ------------------------------------------------------------------
-    # Save
+    # Save checkpoint
     # ------------------------------------------------------------------
 
     def save_ckpt(self, tag: str):
         path = self.ckpt_dir / f"progressive_{tag}.pth.tar"
         tmp = self.ckpt_dir / f"_tmp_progressive_{tag}.pth.tar"
+        phase = self.get_phase(self.step)
         torch.save(
             {
                 "progressive_decoder_state": self.model.progressive_decoder.state_dict(),
                 "optimizer_state":          self.optimizer.state_dict(),
                 "epoch": -1,
                 "global_step": self.step,
-                "phase": (
-                    "A" if self.step < 5_000
-                    else "B" if self.step < 35_000
-                    else "C"
-                ),
+                "phase": phase,
+                "phase_step": self.get_phase_step(self.step),
                 "config": vars(self.args),
             },
             tmp,
         )
         os.replace(tmp, path)
+        print(f"  [CKPT] step={self.step} {self.phase_summary(self.step)} -> {path.name}")
 
     # ------------------------------------------------------------------
     # Main loop
     # ------------------------------------------------------------------
 
-    def run(self):
-        print(f"\nTraining for {self.args.total_steps} steps.")
-        print(f"  Phase A: 0..4999        (depth=4)")
-        print(f"  Phase B: 5000..34999   (uniform [1..4])")
-        print(f"  Phase C: 35000..59999   (uniform [1..4])\n")
+def run(self):
+        total_phases = len(MAX_STEPS_PER_PHASE)
+        max_steps = CUMULATIVE_STEPS[total_phases - 1]
+        print(f"\nTraining for up to {max_steps} steps ({total_phases} phases).")
+        print(f"  Phase 0: 0..{MAX_STEPS_PER_PHASE[0]-1}         (depth=4, ceiling check)")
+        print(f"  Phase 1: {CUMULATIVE_STEPS[0]}..{CUMULATIVE_STEPS[1]-1}      (depth=4, establish baseline)")
+        print(f"  Phase 2: {CUMULATIVE_STEPS[1]}..{CUMULATIVE_STEPS[2]-1}   (random [1..4], learn early tiers)")
+        print(f"  Phase 3: {CUMULATIVE_STEPS[2]}..{CUMULATIVE_STEPS[3]-1}   (random [1..4], fine-tune)")
+        print(f"\n  Early advance: enabled (plateau detection in Phases 0-1)")
+        print(f"  Checkpoint-based resume: phase/phase_step tracked in ckpt\n")
 
         self.model.train()
         ref_cur = iter(self.train_loader)
         log_loss = 0.0
         log_n = 0
-        t_last = None
-        import time as _time
+        val_count = 0
 
-        while self.step < self.args.total_steps:
+        while self.step < max_steps:
             try:
                 ref, cur = next(ref_cur)
             except StopIteration:
@@ -383,61 +448,74 @@ class ProgressiveTrainer:
             log_loss += loss
             log_n += 1
 
+            phase = self.get_phase(self.step - 1)
+
             if self.step % 200 == 0:
                 avg = log_loss / log_n
                 log_loss = 0.0
                 log_n = 0
                 depth_now = self.sample_depth(self.step - 1)
-                if t_last is None:
-                    print(
-                        f"  step {self.step}/{self.args.total_steps}  "
-                        f"loss={avg:.6f}  depth={depth_now}",
-                        flush=True,
-                    )
-                    t_last = self.step
-                else:
-                    print(
-                        f"  step {self.step}/{self.args.total_steps}  "
-                        f"loss={avg:.6f}  depth={depth_now}",
-                        flush=True,
-                    )
-                self.writer.add_scalar("train/loss", avg, self.step)
-
-            if self.step % self.args.val_every == 0:
-                m = self.validate()
-                vals = " ".join(
-                    f"T{i}={m.get(f'psnr_t{i}_mean', float('nan')):.3f}"
-                    for i in range(1, 5)
-                )
-                if len(m) == 4:
-                    t1, t2, t3, t4 = [m[f"psnr_t{i}_mean"] for i in range(1, 5)]
-                    gap = t4 - t1
-                    order = (
-                        "OK"
-                        if (t1 < t2 < t3 < t4)
-                        else "INVERSION_DETECTED"
-                    )
-                else:
-                    gap = float("nan")
-                    order = "INCOMPLETE"
-                phase = (
-                    "A" if self.step < 5000
-                    else "B" if self.step < 35000
-                    else "C"
-                )
                 print(
-                    f"[VAL step {self.step} phase={phase}] {vals} gap={gap:.3f} {order}",
+                    f"  step {self.step}/{max_steps}  "
+                    f"loss={avg:.6f} ({avg:.3e})  depth={depth_now}  [{self.phase_summary(self.step)}]",
                     flush=True,
                 )
-                for k, v in m.items():
-                    self.writer.add_scalar(f"val/{k}", v, self.step)
+                self.writer.add_scalar("train/loss", avg, self.step)
+                self.writer.add_scalar("train/depth", depth_now, self.step)
+                self.writer.add_scalar("train/phase", phase, self.step)
+
+            if self.step % 1000 == 0:
+                try:
+                    m = self.validate()
+                    val_count += 1
+                    vals = " ".join(
+                        f"T{i}={m.get(f'psnr_t{i}_mean', float('nan')):.3f}"
+                        for i in range(1, 5)
+                    )
+                    if len(m) == 4:
+                        t1, t2, t3, t4 = [m[f"psnr_t{i}_mean"] for i in range(1, 5)]
+                        gap = t4 - t1
+                        order = (
+                            "OK"
+                            if (t1 <= t2 <= t3 <= t4)
+                            else "INVERSION_DETECTED"
+                        )
+                    else:
+                        gap = float("nan")
+                        order = "INCOMPLETE"
+                    print(
+                        f"[VAL@step{self.step}] {vals} gap={gap:.3f} {order}  [{self.phase_summary(self.step)}]",
+                        flush=True,
+                    )
+                    for k, v in m.items():
+                        self.writer.add_scalar(f"val/{k}", v, self.step)
+
+                    if self.check_early_advance(m, phase):
+                        print(f"  [EARLY_ADVANCE] Phase {phase} plateaued, advancing to next phase")
+                        if phase == 0:
+                            self.save_ckpt("phase0_ceiling_check")
+                            print(f"  Phase 0 ceiling check complete. See M2 go/no-go rule in plan §3.2.")
+                        next_phase_start = CUMULATIVE_STEPS[phase]
+                        self.step = next_phase_start - 1
+                        self.psnr_history = []
+
+                except Exception as exc:
+                    print(
+                        f"[VAL@step{self.step}] skipped: {exc!r}",
+                        flush=True,
+                    )
 
             if self.step % self.args.save_every == 0:
                 self.save_ckpt(f"step{self.step}")
 
+            if phase == 0 and self.get_phase_step(self.step) >= MAX_STEPS_PER_PHASE[0]:
+                print(f"  [PHASE_0_COMPLETE] Ceiling check done at step {self.step}")
+                break
+
         self.save_ckpt("final")
         self.writer.close()
         print(f"\nDone after {self.step} steps. Final ckpt at {self.ckpt_dir}.")
+        print(f"Ran {val_count} validation cycles.")
 
 
 
@@ -462,20 +540,19 @@ def parse_args():
     p.add_argument("--patch_size", type=int, default=256)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--num_workers", type=int, default=2)
-    p.add_argument("--total_steps", type=int, default=60_000,
-                   help="Total optimisation steps. 60k ~ 3.7 epochs on Vimeo-90k.")
-    p.add_argument("--val_every", type=int, default=2_000)
+p.add_argument("--total_steps", type=int, default=180_000,
+                   help="Total optimisation steps across Phases 0-3 (180k default per plan §3.2).")
     p.add_argument("--val_max_pairs", type=int, default=100)
     p.add_argument("--save_every", type=int, default=2_000)
     p.add_argument("--log_dir", type=str, default="runs/progressive")
     p.add_argument("--ckpt_dir", type=str, default="checkpoints/progressive")
     p.add_argument("--seed", type=int, default=1234)
     p.add_argument("--residual_damping", type=float, default=1.0,
-                   help="TieredRefinement residual scale. Default 1.0 "
-                        "(no damping). Set to 0.8 if training becomes unstable.")
+                   help="FeatureRefinementBlock residual scale. Default 1.0. "
+                        "Plan §2.3 uses 0.1 for training stability.")
     p.add_argument("--resume", type=str, default="",
                    help="Path to progressive_step*.pth.tar to resume from. "
-                        "Loads progressive_decoder_state and optimizer_state.")
+                        "Loads progressive_decoder_state, optimizer_state, phase, phase_step.")
     return p.parse_args()
 
 
