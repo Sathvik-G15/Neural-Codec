@@ -55,7 +55,7 @@ class FeatureRefinementBlock(nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         h = self.lrelu(self.pw1(self.dw1(x)))
         residual = self.pw2(self.dw2(h))
-        return x + 0.1 * residual
+        return x + residual
 
 
 # ---------------------------------------------------------------------------
