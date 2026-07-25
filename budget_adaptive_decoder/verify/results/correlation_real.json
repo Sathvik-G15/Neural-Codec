@@ -1,0 +1,57 @@
+{
+  "experiment": "check_corlation_real_data_fixed_datasets",
+  "n_samples": 30,
+  "decoder_state": "trained (3 epochs, 1.7M params)",
+  "delta_q": {
+    "stage1_mean_dB": 7.977,
+    "stage1_pct_positive": 1.0,
+    "stage1_pct_above_0.1dB": 1.0,
+    "stage2_mean_dB": -0.586,
+    "stage2_pct_positive": 0.133,
+    "stage3_mean_dB": -0.415,
+    "stage3_pct_positive": 0.2,
+    "stage4_mean_dB": 0.432,
+    "stage4_pct_positive": 0.833,
+    "stage4_pct_above_0.1dB": 0.733
+  },
+  "best_correlation": 0.534,
+  "best_correlation_pair": "recon_residual vs Stage4",
+  "passes_threshold": true,
+  "feature_stage_correlations": {
+    "context_energy": [
+      -0.352,
+      0.295,
+      0.416,
+      -0.112
+    ],
+    "recon_residual": [
+      -0.484,
+      0.165,
+      0.344,
+      -0.534
+    ],
+    "prev_energy": [
+      -0.148,
+      0.34,
+      0.297,
+      0.266
+    ],
+    "context_spatial_std": [
+      -0.155,
+      -0.029,
+      0.232,
+      -0.329
+    ]
+  },
+  "findings": [
+    "CRITICAL: Stage 2 and Stage 3 still have negative mean DeltaQ",
+    "Stage 2 mean=-0.586 dB (13% positive)",
+    "Stage 3 mean=-0.415 dB (20% positive)",
+    "Stage 4 mean=+0.432 dB (83% positive) - architecture CAN improve quality",
+    "Stage 1 mean=+7.977 dB (100% positive) - teacher distillation works",
+    "Pattern: improvement, regression, recovery - hybrid loss needs more training",
+    "3 epochs insufficient for K=4 stages with multi-objective loss"
+  ],
+  "go_no_go_phase2": "NO-GO - Stage 2 and 3 need more training first",
+  "action": "Continue Phase 1 training until Stage 2 and 3 mean DeltaQ becomes positive."
+}

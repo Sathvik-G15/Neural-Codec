@@ -1,0 +1,83 @@
+# Phase 3: Policy Network Training via Regression Configuration
+# As specified in Section 8 of the design document
+
+training:
+  num_epochs: 100
+  batch_size: 16
+  learning_rate: 0.0005
+  optimizer: adam
+  patience: 15
+  min_delta: 0.001
+  save_every: 10
+
+model:
+  # Feature extractor (trainable)
+  feature_dim: 64
+  latent_channels: 192
+  motion_channels: 128
+
+  # Policy network (trainable)
+  policy_hidden_dim: 64
+  K: 4
+
+  # Budget encoder (part of policy)
+  budget_embed_dim: 16
+
+budget_sampling:
+  # Mixture distribution per Issue 3.3 fix:
+  # 50% Beta(2,2) - mass concentrated around B=0.5 (general training)
+  # 20% Beta(1,1) - uniform exploration across [0, 1]
+  # 15% Beta(5,2) - favoring higher budgets (desktop deployment)
+  # 15% point masses at {0.3, 0.5, 0.9} for phone/mid/desktop deployment classes
+  distribution: mixture
+  mixture_components:
+    - type: beta
+      alpha: 2.0
+      beta: 2.0
+      weight: 0.50
+    - type: beta
+      alpha: 1.0
+      beta: 1.0
+      weight: 0.20
+    - type: beta
+      alpha: 5.0
+      beta: 2.0
+      weight: 0.15
+  point_masses:
+    - value: 0.3
+      weight: 0.05
+    - value: 0.5
+      weight: 0.05
+    - value: 0.9
+      weight: 0.05
+
+augmentation:
+  # Reference frame corruption (from Section 8)
+  # Applied ONLY during Phase 3 (NOT Phase 1)
+  reference_frame_corruption:
+    enabled: true
+    sigma_slope: 0.005
+    sigma_max: 0.02
+
+loss:
+  # ΔQ regression loss only (no reconstruction loss)
+  type: mse
+  weight: 1.0
+
+dataset:
+  name: vimeo90k
+  root: ./data/vimeo90k
+  resolution: [448, 256]
+
+  # Use precomputed ΔQ targets from Phase 2
+  delta_q_targets: ./delta_q_cache/delta_q_targets.pt
+
+frozen_components:
+  # These are frozen during Phase 3
+  - teacher
+  - decoder
+
+checkpoint:
+  dir: ./checkpoints/phase3
+  save_best: true
+  save_final: true

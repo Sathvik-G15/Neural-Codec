@@ -1,0 +1,50 @@
+# Phase 1: Budget-Adaptive Decoder Distillation Configuration
+# As specified in Section 8 of the design document
+
+training:
+  num_epochs: 100
+  batch_size: 8
+  learning_rate: 0.0001
+  optimizer: adam
+  patience: 10
+  min_delta: 0.001
+  save_every: 10
+
+model:
+  latent_channels: 192
+  motion_channels: 128
+  base_channels: 64
+  hidden_channels: 128
+  K: 4
+
+stage_costs:
+  # Stage costs as List[float] = [C_0, C_1, C_2, C_3, C_4]
+  # per Issue 1.1 fix; scheduler accepts this format.
+  # C_0 = DCVC teacher decode cost (measured by verify/check_stage_costs.py)
+  # C_1:C_2:C_3:C_4 ≈ 4:2:2:1 (Issue 2.4 - analytical pending verification)
+  # Update from verify/check_stage_costs.py once measured.
+  C_0: 5.0    # placeholder: DCVC teacher decode cost (Issue 2.4 - pending)
+  C_1: 4.0
+  C_2: 2.0
+  C_3: 2.0
+  C_4: 1.0
+  C_full: 9.0
+  C_total: 14.0
+
+dataset:
+  name: vimeo90k
+  root: ./data/vimeo90k
+  resolution: [448, 256]
+  train_split: train
+  val_split: val
+
+validation:
+  # Monotonicity verification criteria (from Section 6.5)
+  # PSNR(k) >= PSNR(k-1) for >99% of frame-depth pairs
+  monotonicity_threshold: 0.99
+  val_samples: 1000
+
+checkpoint:
+  dir: ./checkpoints/phase1
+  save_best: true
+  save_final: true

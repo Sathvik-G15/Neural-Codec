@@ -1,0 +1,46 @@
+{
+  "experiment": "check_correlation_P1_trained",
+  "decoder_state": "trained (3 epochs, 1.7M params)",
+  "n_samples": 30,
+  "best_correlation": 0.83,
+  "best_correlation_pair": "prev_energy vs Stage2",
+  "threshold": 0.3,
+  "PASS": true,
+  "delta_q": {
+    "stage1_mean": 8.214,
+    "stage1_pct_positive": 1.0,
+    "stage2_mean": -0.816,
+    "stage2_pct_positive": 0.167,
+    "stage3_mean": -0.492,
+    "stage3_pct_positive": 0.233,
+    "stage4_mean": 0.621,
+    "stage4_pct_positive": 0.967
+  },
+  "feature_stage_correlations": {
+    "context_energy": [
+      -0.358,
+      0.431,
+      -0.055,
+      0.106
+    ],
+    "recon_residual": [
+      -0.233,
+      0.18,
+      0.215,
+      -0.467
+    ],
+    "prev_energy": [
+      -0.783,
+      0.83,
+      0.408,
+      0.485
+    ],
+    "context_spatial_std": [
+      0.476,
+      -0.304,
+      -0.641,
+      -0.296
+    ]
+  },
+  "notes": "Strong correlations across multiple features. Stage 1 \u0394Q is uniformly positive due to teacher distillation, but Stages 2-4 still show varied deltas. Two-layer framing upheld: budget-adaptive (K+1 operating points) + content-adaptive (correlation > threshold)."
+}

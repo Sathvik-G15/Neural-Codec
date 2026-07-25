@@ -1,0 +1,78 @@
+# Phase 4: Decoder Adaptation Configuration
+# As specified in Section 8 of the design document
+
+training:
+  num_epochs: 50
+  batch_size: 16
+  base_learning_rate: 0.0005
+
+  # Decoder learning rate = 0.05 * base_lr (from Section 8)
+  decoder_lr_ratio: 0.05
+  decoder_learning_rate: 0.000025
+
+  optimizer: adam
+  patience: 10
+  min_delta: 0.001
+  save_every: 10
+
+model:
+  K: 4
+
+budget_sampling:
+  # Same as Phase 3 - mixture distribution (Issue 3.3 fix)
+  distribution: mixture
+  mixture_components:
+    - type: beta
+      alpha: 2.0
+      beta: 2.0
+      weight: 0.50
+    - type: beta
+      alpha: 1.0
+      beta: 1.0
+      weight: 0.20
+    - type: beta
+      alpha: 5.0
+      beta: 2.0
+      weight: 0.15
+  point_masses:
+    - value: 0.3
+      weight: 0.05
+    - value: 0.5
+      weight: 0.05
+    - value: 0.9
+      weight: 0.05
+
+augmentation:
+  # Reference frame corruption (same as Phase 3)
+  reference_frame_corruption:
+    enabled: true
+    sigma_slope: 0.005
+    sigma_max: 0.02
+
+loss:
+  # Reconstruction loss ONLY - no regression term
+  # (from Section 8: "no regression term in loss")
+  type: mse
+  weight: 1.0
+
+dataset:
+  name: vimeo90k
+  root: ./data/vimeo90k
+  resolution: [448, 256]
+
+frozen_components:
+  # Policy is frozen in Phase 4 - no gradient updates
+  # (from Section 8: "Policy Network is frozen")
+  - teacher
+  - policy
+  - extractor
+
+checkpoint:
+  dir: ./checkpoints/phase4
+  save_best: true
+  save_final: true
+
+validation:
+  # Verify quality monotonicity holds after Phase 4
+  check_monotonicity: true
+  monotonicity_threshold: 0.95

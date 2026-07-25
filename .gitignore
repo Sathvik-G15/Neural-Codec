@@ -33,14 +33,11 @@ runs/
 *.h5
 *.onnx
 
-# Video / Images / Binaries
+# Video / Archives (raw data files explicitly excluded)
 *.yuv
 *.mp4
 *.avi
 *.mkv
-*.png
-*.jpg
-*.jpeg
 *.bin
 *.tar
 *.zip
@@ -49,3 +46,42 @@ runs/
 # OS generated files
 .DS_Store
 Thumbs.db
+
+# Dataset repositories (large cloned third-party code)
+DCVC-original/
+DCVC-repo/
+
+# Local training datasets (raw video frames)
+vimeo90k_flat/
+synthetic_video/
+
+# Phase 2 cache (re-generated each run)
+delta_q_cache/
+
+# HuggingFace dataset download scripts (one-off helpers, not for production)
+download_*.py
+flatten_vimeo_data.py
+organize_frames.py
+verify_data_structure.py
+test_sources.py
+search_hf.py
+setup_data_lists.py
+check_hf_datasets.py
+cleanup_check.py
+
+# Diagnostic / debug / smoke tests (one-off inspection scripts)
+debug_datasets.py
+debug_psnr_comparison.py
+debug_vimeo90k_loader.py
+correlation_output.log
+phase1_mini_test.py
+phase2_mini_test.py
+phase3_mini_test.py
+phase4_mini_test.py
+phase2_delta_q_inspection.py
+smoke_test_pipeline.py
+verify_scheduler_C0.py
+run_phase1_fast.py
+
+# Kaggke-specific overrides
+kaggle_workspace.json

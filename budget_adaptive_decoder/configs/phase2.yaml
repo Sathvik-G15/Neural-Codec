@@ -1,0 +1,47 @@
+# Phase 2: Offline ΔQ Target Precomputation Configuration
+# As specified in Section 8 of the design document
+
+# NOTE: Phase 2 is NOT a training phase - it's a single forward pass
+# to compute ΔQ targets for Phase 3 regression training.
+
+precomputation:
+  # Number of frames to process (stratified sampling)
+  # Design doc: 30% of sequences, only P-frames (frames 2-7 of septuplet)
+  # Approximately 55,000-80,000 frames total
+  num_frames: 60000
+  sampling_strategy: stratified
+  include_i_frames: false
+
+  # Motion proxy for stratified sampling
+  # (mean frame-to-frame absolute difference)
+  motion_percentile: 70
+
+model:
+  # Use Phase 1 trained decoder for this computation
+  checkpoint_path: ./checkpoints/phase1/phase1_final.pt
+
+  # ΔQ will be computed at these depths
+  depths: [0, 1, 2, 3, 4]
+
+dataset:
+  name: vimeo90k
+  root: ./data/vimeo90k
+  resolution: [448, 256]
+
+  # Augmentation: 70% Vimeo90k + 30% BVI-DVC (from Section 8)
+  augmentation:
+    enabled: true
+    vimeo90k_ratio: 0.7
+    bvi_dvc_ratio: 0.3
+    bvi_dvc_root: ./data/bvi_dvc
+    motion_filter: true
+
+output:
+  dir: ./delta_q_cache
+  filename: delta_q_targets.pt
+  compression: true
+
+validation:
+  # Verify ΔQ statistics on held-out set
+  val_split: val
+  val_samples: 1000
