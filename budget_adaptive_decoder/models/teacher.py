@@ -3,8 +3,14 @@ DCVC Wrapper module for Budget-Constrained Neural Decoder.
 
 Uses the ORIGINAL Microsoft DCVC model which has single-stage output.
 The checkpoint was trained with the original DCVC architecture.
+
+Path resolution order (first non-empty wins):
+    1. explicit constructor arg (pretrained_path or dcvc_src_path)
+    2. environment variable DCVC_PRETRAINED_PATH / DCVC_SRC_PATH
+    3. hardcoded defaults matching the local DCVC-original layout
 """
 
+import os
 import sys
 from pathlib import Path
 from typing import List, Dict, Optional
@@ -29,26 +35,74 @@ class DCVCWrapper(nn.Module):
 
     # Original DCVC is single-stage (1 output)
     DCVC_STAGE_COUNT = 1
-    DCVC_ORIGINAL_PATH = Path(__file__).parent.parent.parent / "DCVC-original" / "DCVC-family" / "DCVC"
-    DCVC_CHECKPOINT_PATH = Path(__file__).parent.parent.parent / "DCVC-repo" / "DCVC-family" / "DCVC" / "checkpoints" / "model_dcvc_quality_3_psnr.pth"
+    DEFAULT_DCVC_SRC_PATH = (
+        Path(__file__).parent.parent.parent
+        / "DCVC-original"
+        / "DCVC-family"
+        / "DCVC"
+    )
+    DEFAULT_DCVC_CHECKPOINT_PATH = (
+        Path(__file__).parent.parent.parent
+        / "DCVC-repo"
+        / "DCVC-family"
+        / "DCVC"
+        / "checkpoints"
+        / "model_dcvc_quality_3_psnr.pth"
+    )
 
     def __init__(
         self,
         device: Optional[torch.device] = None,
         load_pretrained: bool = True,
+        dcvc_src_path: Optional[str] = None,
+        pretrained_path: Optional[str] = None,
     ):
+        """
+        Args:
+            device: torch device for the teacher.
+            load_pretrained: whether to load the .pth.tar checkpoint.
+            dcvc_src_path: directory containing DCVC's `src/` tree
+                (the directory whose `src/models/DCVC_net.py` is importable).
+                Defaults to local DCVC-original/, or env var DCVC_SRC_PATH.
+            pretrained_path: absolute path to model_dcvc_quality_3_psnr.pth
+                (or any DCVC-style state dict). Defaults to local
+                DCVC-repo/.../checkpoints/, or env var DCVC_PRETRAINED_PATH.
+        """
         super().__init__()
-        self.device = device or torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Resolve src / pretrained paths with priority order:
+        #   explicit arg > env var > repo-relative default
+        default_src = str(self.DEFAULT_DCVC_SRC_PATH)
+        default_ckpt = str(self.DEFAULT_DCVC_CHECKPOINT_PATH)
+        self.dcvc_src_path = (
+            dcvc_src_path
+            or os.environ.get("DCVC_SRC_PATH")
+            or default_src
+        )
+        self.pretrained_path = (
+            pretrained_path
+            or os.environ.get("DCVC_PRETRAINED_PATH")
+            or default_ckpt
+        )
+
+        self.device = device or torch.device(
+            "cuda" if torch.cuda.is_available() else "cpu"
+        )
         self.dcvc = None
         self._load_dcvc(load_pretrained)
 
     def _load_dcvc(self, load_pretrained: bool):
-        """Load DCVC model from original Microsoft DCVC repo."""
+        """Load DCVC model from original Microsoft DCVC repo.
+
+        The src directory must be importable on sys.path so that
+        `from src.models.DCVC_net import DCVC_net` resolves. This is
+        how DCVC's own code expects to be imported.
+        """
         try:
-            dcvc_repo_src = str(self.DCVC_ORIGINAL_PATH / "src")
+            dcvc_repo_src = str(Path(self.dcvc_src_path) / "src")
             if dcvc_repo_src not in sys.path:
                 sys.path.insert(0, dcvc_repo_src)
-            sys_path_parent = str(self.DCVC_ORIGINAL_PATH)
+            sys_path_parent = str(Path(self.dcvc_src_path))
             if sys_path_parent not in sys.path:
                 sys.path.insert(0, sys_path_parent)
 
@@ -57,15 +111,25 @@ class DCVCWrapper(nn.Module):
             self.dcvc = DCVC_net()
 
             if load_pretrained:
-                checkpoint_path = self.DCVC_CHECKPOINT_PATH
+                checkpoint_path = Path(self.pretrained_path)
                 if checkpoint_path.exists():
                     state_dict = torch.load(
                         checkpoint_path,
                         map_location=self.device,
                         weights_only=False
                     )
+                    # Match DCVC's load_dict: it handles both raw and
+                    # `state_dict=` wrapped checkpoints.
+                    if isinstance(state_dict, dict):
+                        for k in ("state_dict", "model_state_dict", "model"):
+                            if k in state_dict:
+                                state_dict = state_dict[k]
+                                break
                     self.dcvc.load_dict(state_dict)
-                    print("Successfully loaded DCVC pretrained weights from original DCVC")
+                    print(
+                        f"Successfully loaded DCVC pretrained weights from "
+                        f"{checkpoint_path}"
+                    )
                 else:
                     print(f"DCVC checkpoint not found at {checkpoint_path}")
 
@@ -73,7 +137,7 @@ class DCVCWrapper(nn.Module):
             self._freeze_all_parameters()
 
         except ImportError as e:
-            print(f"Warning: Could not import DCVC from DCVC-original: {e}")
+            print(f"Warning: Could not import DCVC from {self.dcvc_src_path}: {e}")
             self.dcvc = None
         except Exception as e:
             print(f"Warning: Could not load DCVC: {e}")

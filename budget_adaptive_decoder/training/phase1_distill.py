@@ -13,7 +13,19 @@ The teacher is a frozen DCVC that produces:
 
 The student decoder takes (context, prev_frame) and produces
 4 progressive refinements R_1, R_2, R_3, R_4.
+
+CLI Usage (Kaggle)
+------------------
+    python -m budget_adaptive_decoder.training.phase1_distill \
+        --pretrained  /kaggle/input/.../model_dcvc_quality_3_psnr.pth \
+        --data_root   /kaggle/input/.../vimeo_septuplet \
+        --output_dir  /kaggle/working/checkpoints/phase1 \
+        --batch_size 2 --epochs 30 --lr 1e-4
 """
+
+import argparse
+import os
+import random
 
 import torch
 import torch.nn.functional as F
@@ -32,6 +44,40 @@ logger = logging.getLogger(__name__)
 
 # Stage weights for ground truth supervision (stages 2, 3, 4)
 GT_WEIGHTS = {2: 0.5, 3: 0.75, 4: 1.0}
+
+
+# Middle frame of the septuplet matches the Phase 2 / Phase 4 indexing.
+# We pick index 3 of frames [7, 3, H, W] (1-indexed: 4th frame).
+CURR_FRAME_INDEX = 3
+
+
+def _unpack_batch(batch):
+    """
+    Normalise a batch into (curr_frame, ref_frame) regardless of dataset.
+
+    Supports both:
+      - Vimeo90kDataset  →  (frames[B,7,3,H,W], bitstream_dict, prev_frame[B,3,H,W])
+      - GenericVideoDataset → (curr_frame[B,3,H,W], ref_frame[B,3,H,W])
+
+    For the 3-tuple form we extract:
+        curr_frame = frames[:, CURR_FRAME_INDEX, :, :]  (middle frame, the predicted one)
+        ref_frame  = prev_frame                         (frame im1 of the septuplet)
+    """
+    if isinstance(batch, (tuple, list)) and len(batch) == 3:
+        frames, _bitstream_dict, prev_frame = batch
+        curr_frame = frames[:, CURR_FRAME_INDEX]
+        ref_frame = prev_frame
+        return curr_frame, ref_frame
+
+    # Fall through: 2-tuple (curr_frame, ref_frame)
+    if isinstance(batch, (tuple, list)) and len(batch) == 2:
+        curr_frame, ref_frame = batch
+        return curr_frame, ref_frame
+
+    raise ValueError(
+        f"Unsupported batch format from dataloader: "
+        f"type={type(batch).__name__}, len={len(batch) if hasattr(batch, '__len__') else 'n/a'}"
+    )
 
 
 class Phase1Trainer:
@@ -149,7 +195,15 @@ class Phase1Trainer:
         Train for one epoch.
 
         Args:
-            train_loader: DataLoader yielding (curr_frame, ref_frame)
+            train_loader: DataLoader yielding either:
+                            - the 3-tuple (frames, bitstream_dict, prev_frame) from
+                              Vimeo90kDataset (frames: [B, 7, 3, H, W] septuplet)
+                            - or the 2-tuple (curr_frame, ref_frame) from
+                              GenericVideoDataset
+                In both cases, curr_frame = frame at chosen septuplet position (we
+                use the middle frame index = 3, matching Phase 2 / Phase 4 wiring
+                for consistency), ref_frame = frames[0].
+
             epoch: Current epoch number
 
         Returns:
@@ -167,7 +221,8 @@ class Phase1Trainer:
 
         pbar = tqdm(train_loader, desc=f"Phase 1 Epoch {epoch}")
 
-        for curr_frame, ref_frame in pbar:
+        for batch in pbar:
+            curr_frame, ref_frame = _unpack_batch(batch)
             curr_frame = curr_frame.to(self.device)
             ref_frame = ref_frame.to(self.device)
 
@@ -215,11 +270,9 @@ class Phase1Trainer:
         """
         Validate the model.
 
-        Args:
-            val_loader: Validation data loader yielding (curr_frame, ref_frame)
-
-        Returns:
-            Dictionary of validation metrics
+        Accepts both 2-tuple (curr_frame, ref_frame) from
+        GenericVideoDataset and 3-tuple (frames, bitstream_dict, prev_frame)
+        from Vimeo90kDataset.
         """
         self.decoder.eval()
         epoch_losses = {
@@ -231,19 +284,17 @@ class Phase1Trainer:
         }
         num_batches = 0
 
-        for curr_frame, ref_frame in val_loader:
+        for batch in val_loader:
+            curr_frame, ref_frame = _unpack_batch(batch)
             curr_frame = curr_frame.to(self.device)
             ref_frame = ref_frame.to(self.device)
 
-            # Teacher
             teacher_out = self.teacher.get_stage_targets(curr_frame, ref_frame)
             teacher_recon = teacher_out['stage_recons'][0]
             context = teacher_out['context']
 
-            # Student
             student_recons = self.decoder.decode_all_stages_phase1(context, ref_frame)
 
-            # Loss
             loss, loss_components = self.compute_phase1_loss(
                 student_recons, teacher_recon, curr_frame
             )
@@ -368,9 +419,145 @@ def train_phase1(
     }
 
 
+# ============================================================================
+# CLI entry-point (Kaggle-friendly)
+# ============================================================================
+
+def _build_kaggle_loaders(args, dataset_cls):
+    """
+    Build train / val DataLoaders from a Vimeo90k-style dataset class.
+
+    Robust to two layouts (auto-detected by the dataset):
+      Kaggle : <root>/sep_{train,test}list.txt + sequences/<SSSSS>/<CCCC>/im{1..7}.png
+      Flat   : <root>/{train,val}_list.txt + <folder>/im{1..7}.png
+    """
+    train_ds = dataset_cls(root=args.data_root, split="train")
+    val_ds = dataset_cls(root=args.data_root, split="val")
+
+    train_loader = DataLoader(
+        train_ds,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=args.num_workers,
+        pin_memory=torch.cuda.is_available(),
+        drop_last=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    val_loader = DataLoader(
+        val_ds,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=max(args.num_workers, 1),
+        pin_memory=torch.cuda.is_available(),
+        drop_last=False,
+    )
+    print(
+        f"  Dataset: train={len(train_ds)} clips ({len(train_loader)} batches), "
+        f"val={len(val_ds)} clips ({len(val_loader)} batches)"
+    )
+    return train_loader, val_loader
+
+
+def _parse_args():
+    """CLI argument parser for Phase 1 (Kaggle-friendly)."""
+    p = argparse.ArgumentParser(
+        description="Train Phase 1 of Budget-Adaptive Decoder on Vimeo90k"
+    )
+    p.add_argument("--pretrained", required=True,
+                   help="Path to DCVC .pth.tar baseline "
+                        "(e.g., /kaggle/input/.../model_dcvc_quality_3_psnr.pth)")
+    p.add_argument("--data_root", required=True,
+                   help="Root containing sep_trainlist.txt + sequences/  "
+                        "(e.g. /kaggle/input/.../vimeo_septuplet)")
+    p.add_argument("--output_dir", default="/kaggle/working/checkpoints/phase1")
+    p.add_argument("--batch_size", type=int, default=2)
+    p.add_argument("--epochs", type=int, default=30)
+    p.add_argument("--lr", type=float, default=1e-4)
+    p.add_argument("--num_workers", type=int, default=2)
+    p.add_argument("--save_every", type=int, default=1)
+    p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--dcvc_src", default=None,
+                   help="Directory with DCVC's src/ importable tree; "
+                        "defaults to env DCVC_SRC_PATH or local default.")
+    p.add_argument("--lambda_rd", type=float, default=1.0,
+                   help="Reserved weight (currently unused in Phase 1 hybrid loss).")
+    p.add_argument("--resume", default=None,
+                   help="Path to phase1_*.pt checkpoint to resume from.")
+    return p.parse_args()
+
+
+def main_entry():
+    """Phase 1 driver: builds teacher + decoder + loaders, then trains."""
+    args = _parse_args()
+
+    random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    torch.backends.cudnn.benchmark = True
+
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    print(f"\n[Teacher] loading DCVC from {args.pretrained}")
+    teacher = DCVCWrapper(
+        device=device,
+        load_pretrained=True,
+        pretrained_path=args.pretrained,
+        dcvc_src_path=args.dcvc_src,
+    )
+    if teacher.dcvc is None:
+        raise RuntimeError(
+            "DCVC teacher failed to import. Ensure --dcvc_src points to the "
+            "DCVC-family/DCVC directory whose src/ tree is on sys.path."
+        )
+    print(f"  Teacher params (trainable / total): "
+          f"{sum(p.numel() for p in teacher.dcvc.parameters() if p.requires_grad):,} / "
+          f"{sum(p.numel() for p in teacher.dcvc.parameters()):,}")
+
+    print("\n[Student] creating BudgetAdaptiveDecoder")
+    decoder = BudgetAdaptiveDecoder().to(device)
+    n_train = sum(p.numel() for p in decoder.parameters())
+    print(f"  Decoder params: {n_train:,}")
+
+    if args.resume:
+        ckpt = torch.load(args.resume, map_location=device, weights_only=False)
+        decoder.load_state_dict(ckpt["decoder_state_dict"])
+        print(f"  Resumed decoder weights from {args.resume}")
+
+    print(f"\n[Data] loading Vimeo90k from {args.data_root}")
+    from ..data.vimeo90k import Vimeo90kDataset
+    train_loader, val_loader = _build_kaggle_loaders(args, Vimeo90kDataset)
+
+    optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
+
+    config = {
+        "num_epochs": args.epochs,
+        "save_every": args.save_every,
+        "patience": args.epochs + 1,
+        "min_delta": 0.001,
+        "lambda_rd": args.lambda_rd,
+    }
+
+    print(f"\n[Train] output_dir={args.output_dir} "
+          f"batch_size={args.batch_size} epochs={args.epochs} lr={args.lr}")
+    Path(args.output_dir).mkdir(parents=True, exist_ok=True)
+
+    decoder, final_metrics = train_phase1(
+        decoder=decoder,
+        teacher=teacher,
+        train_loader=train_loader,
+        val_loader=val_loader,
+        optimizer=optimizer,
+        device=device,
+        config=config,
+        checkpoint_dir=Path(args.output_dir),
+        num_epochs=args.epochs,
+    )
+
+    print(f"\nDone. Final metrics: {final_metrics}")
+    print(f"Checkpoints in {args.output_dir}")
+
+
 if __name__ == "__main__":
-    print("=" * 60)
-    print("Phase 1 Training Module")
-    print("=" * 60)
-    print("Use this module via import from training package")
-    print("=" * 60)
+    main_entry()

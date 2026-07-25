@@ -59,6 +59,8 @@ synthetic_video/
 delta_q_cache/
 
 # HuggingFace dataset download scripts (one-off helpers, not for production)
+check_hf_datasets.py
+cleanup_check.py
 download_*.py
 flatten_vimeo_data.py
 organize_frames.py
@@ -66,22 +68,31 @@ verify_data_structure.py
 test_sources.py
 search_hf.py
 setup_data_lists.py
-check_hf_datasets.py
-cleanup_check.py
 
 # Diagnostic / debug / smoke tests (one-off inspection scripts)
+correlation_output.log
 debug_datasets.py
 debug_psnr_comparison.py
 debug_vimeo90k_loader.py
-correlation_output.log
 phase1_mini_test.py
+phase2_delta_q_inspection.py
 phase2_mini_test.py
 phase3_mini_test.py
 phase4_mini_test.py
-phase2_delta_q_inspection.py
+run_phase1_fast.py
 smoke_test_pipeline.py
 verify_scheduler_C0.py
-run_phase1_fast.py
 
-# Kaggke-specific overrides
+# Other ad-hoc data subtrees (one-off extractions, kept locally only)
+synthetic_video/
+synthetic_video_png/
+video_subset/
+vimeo_septuplet_subset/
+run_phase1_gpu.py
+
+# Kaggle-specific overrides
 kaggle_workspace.json
+
+# Phase 1 Kaggle ad-hoc test scripts (kept locally only)
+test_phase1_kaggle.py
+
