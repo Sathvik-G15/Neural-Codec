@@ -92,56 +92,86 @@ class DCVCWrapper(nn.Module):
         self._load_dcvc(load_pretrained)
 
     def _load_dcvc(self, load_pretrained: bool):
-        """Load DCVC model from original Microsoft DCVC repo.
+        """Load DCVC model from one of:
+
+        1. explicit constructor arg / env var (custom Kaggle input dir)
+        2. vendored fallback `budget_adaptive_decoder/external/dcvc/src/`
+           (this directory is shipped with the package and is always
+           available, even when the user has not separately uploaded
+           the DCVC source tree to Kaggle)
 
         The src directory must be importable on sys.path so that
-        `from src.models.DCVC_net import DCVC_net` resolves. This is
-        how DCVC's own code expects to be imported.
+        `from src.models.DCVC_net import DCVC_net` resolves.
         """
-        try:
-            dcvc_repo_src = str(Path(self.dcvc_src_path) / "src")
-            if dcvc_repo_src not in sys.path:
-                sys.path.insert(0, dcvc_repo_src)
-            sys_path_parent = str(Path(self.dcvc_src_path))
-            if sys_path_parent not in sys.path:
-                sys.path.insert(0, sys_path_parent)
+        # First, try the vendored source tree packaged with this repo
+        vendored_src = Path(__file__).parent.parent / "external" / "dcvc"
+        if vendored_src.exists() and not os.environ.get("DCVC_SKIP_VENDORED"):
+            vendored_candidate = str(vendored_src)
+            if vendored_candidate not in sys.path:
+                sys.path.insert(0, vendored_candidate)
 
-            from src.models.DCVC_net import DCVC_net
+        # Then try the user-specified or default location
+        candidate_paths = []
+        if self.dcvc_src_path and Path(self.dcvc_src_path).exists():
+            candidate_paths.append(self.dcvc_src_path)
+        candidate_paths.append(str(vendored_src))  # always include as fallback
 
-            self.dcvc = DCVC_net()
+        imported = False
+        for candidate in candidate_paths:
+            try:
+                candidate_src = str(Path(candidate) / "src")
+                if candidate_src not in sys.path:
+                    sys.path.insert(0, candidate_src)
+                if str(Path(candidate)) not in sys.path:
+                    sys.path.insert(0, str(Path(candidate)))
 
-            if load_pretrained:
-                checkpoint_path = Path(self.pretrained_path)
-                if checkpoint_path.exists():
-                    state_dict = torch.load(
-                        checkpoint_path,
-                        map_location=self.device,
-                        weights_only=False
-                    )
-                    # Match DCVC's load_dict: it handles both raw and
-                    # `state_dict=` wrapped checkpoints.
-                    if isinstance(state_dict, dict):
-                        for k in ("state_dict", "model_state_dict", "model"):
-                            if k in state_dict:
-                                state_dict = state_dict[k]
-                                break
-                    self.dcvc.load_dict(state_dict)
-                    print(
-                        f"Successfully loaded DCVC pretrained weights from "
-                        f"{checkpoint_path}"
-                    )
+                # Use importlib to reload in case the module was previously
+                # imported with a different (broken) state.
+                import importlib
+                if "src.models.DCVC_net" in sys.modules:
+                    importlib.reload(sys.modules["src.models.DCVC_net"])
                 else:
-                    print(f"DCVC checkpoint not found at {checkpoint_path}")
+                    import src.models.DCVC_net as _dcvc_net_mod
+                    _dcvc_net_mod = importlib.import_module("src.models.DCVC_net")
 
-            self.dcvc = self.dcvc.to(self.device)
-            self._freeze_all_parameters()
+                from src.models.DCVC_net import DCVC_net
+                self.dcvc = DCVC_net()
+                print(f"  DCVC teacher loaded from source: {candidate}")
+                imported = True
+                break
+            except Exception as inner_exc:
+                print(f"  [skip] could not import DCVC from {candidate}: {inner_exc}")
 
-        except ImportError as e:
-            print(f"Warning: Could not import DCVC from {self.dcvc_src_path}: {e}")
+        if not imported:
             self.dcvc = None
-        except Exception as e:
-            print(f"Warning: Could not load DCVC: {e}")
-            self.dcvc = None
+            return
+
+        # Pretrained weights: load only if requested.
+        if load_pretrained:
+            checkpoint_path = Path(self.pretrained_path)
+            if checkpoint_path.exists():
+                state_dict = torch.load(
+                    checkpoint_path,
+                    map_location=self.device,
+                    weights_only=False
+                )
+                # Match DCVC's load_dict: it handles both raw and
+                # `state_dict=` wrapped checkpoints.
+                if isinstance(state_dict, dict):
+                    for k in ("state_dict", "model_state_dict", "model"):
+                        if k in state_dict:
+                            state_dict = state_dict[k]
+                            break
+                self.dcvc.load_dict(state_dict)
+                print(
+                    f"  Successfully loaded DCVC pretrained weights from "
+                    f"{checkpoint_path}"
+                )
+            else:
+                print(f"  DCVC checkpoint not found at {checkpoint_path}")
+
+        self.dcvc = self.dcvc.to(self.device)
+        self._freeze_all_parameters()
 
     def _freeze_all_parameters(self):
         """Freeze all parameters - teacher is never trained."""

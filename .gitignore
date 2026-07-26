@@ -95,4 +95,6 @@ kaggle_workspace.json
 
 # Phase 1 Kaggle ad-hoc test scripts (kept locally only)
 test_phase1_kaggle.py
+test_teacher_fallback.py
+test_teacher_kaggle_fallback.py
 
