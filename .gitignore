@@ -21,9 +21,9 @@ env/
 .idea/
 *.swp
 
-# Deep Learning / Data
-data/
-datasets/
+# Deep Learning / Data (top-level only; do not match budget_adaptive_decoder/data)
+/data/
+/datasets/
 logs/
 checkpoints/
 runs/
@@ -95,6 +95,7 @@ kaggle_workspace.json
 
 # Phase 1 Kaggle ad-hoc test scripts (kept locally only)
 test_phase1_kaggle.py
+test_phase1_e2e.py
 test_teacher_fallback.py
 test_teacher_kaggle_fallback.py
 
