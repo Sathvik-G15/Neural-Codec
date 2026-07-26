@@ -33,7 +33,6 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import logging
-from tqdm import tqdm
 
 from ..models.decoder import BudgetAdaptiveDecoder
 from ..models.teacher import DCVCWrapper
@@ -99,6 +98,7 @@ class Phase1Trainer:
         device: torch.device,
         config: Dict[str, Any],
         checkpoint_dir: Optional[Path] = None,
+        log_every: Optional[int] = None,
     ):
         """
         Args:
@@ -108,6 +108,9 @@ class Phase1Trainer:
             device: Device to train on
             config: Training configuration dict
             checkpoint_dir: Directory to save checkpoints
+            log_every: Print a training log line every N batches (default 500).
+                       Set to 0 or None to disable mid-epoch logging (will only log
+                       per-epoch + validation summary).
         """
         self.decoder = decoder
         self.teacher = teacher
@@ -124,6 +127,13 @@ class Phase1Trainer:
         self.min_delta = config.get("min_delta", 0.001)
         self.best_loss = float("inf")
         self.wait = 0
+
+        # Logging cadence: per-batch logs balloon Kaggle's 20MB log limit.
+        # Default to 500 batches; user-configurable via --log_every or config.
+        if log_every is None:
+            log_every = int(config.get("log_every", 500))
+        self.log_every = max(int(log_every), 0)
+        self._tqdm_disabled = True  # we never use tqdm in this trainer
 
         self.loss_history = []
         self.val_loss_history = []
@@ -218,10 +228,11 @@ class Phase1Trainer:
             'loss_s4_gt': 0.0,
         }
         num_batches = 0
+        # Discard per-step totals to avoid Python int accumulation overhead.
+        # We only emit a log every `log_every` batches.
+        log_every = self.log_every
 
-        pbar = tqdm(train_loader, desc=f"Phase 1 Epoch {epoch}")
-
-        for batch in pbar:
+        for batch_idx, batch in enumerate(train_loader, start=1):
             curr_frame, ref_frame = _unpack_batch(batch)
             curr_frame = curr_frame.to(self.device)
             ref_frame = ref_frame.to(self.device)
@@ -255,7 +266,14 @@ class Phase1Trainer:
                     epoch_losses[k] += v
             num_batches += 1
 
-            pbar.set_postfix({"loss": f"{loss.item():.4f}"})
+            # Periodic per-batch log: keep the running loss in a single short
+            # string. We only build/print a log line every `log_every` batches.
+            if log_every > 0 and (batch_idx % log_every == 0):
+                running_loss = epoch_losses['loss_total'] / batch_idx
+                logger.info(
+                    f"[trn] ep={epoch} step={batch_idx}/{len(train_loader)} "
+                    f"avg_loss={running_loss:.6f} step_loss={loss.item():.6f}"
+                )
 
         # Average losses
         avg_losses = {k: v / max(num_batches, 1) for k, v in epoch_losses.items()}
@@ -273,6 +291,9 @@ class Phase1Trainer:
         Accepts both 2-tuple (curr_frame, ref_frame) from
         GenericVideoDataset and 3-tuple (frames, bitstream_dict, prev_frame)
         from Vimeo90kDataset.
+
+        Logs at most once (one-line summary) to stay within Kaggle's
+        20MB log cap.
         """
         self.decoder.eval()
         epoch_losses = {
@@ -284,7 +305,7 @@ class Phase1Trainer:
         }
         num_batches = 0
 
-        for batch in val_loader:
+        for batch_idx, batch in enumerate(val_loader, start=1):
             curr_frame, ref_frame = _unpack_batch(batch)
             curr_frame = curr_frame.to(self.device)
             ref_frame = ref_frame.to(self.device)
@@ -308,6 +329,16 @@ class Phase1Trainer:
         avg_losses = {f"val_{k}": v for k, v in avg_losses.items()}
 
         self.val_loss_history.append(avg_losses)
+
+        # Single-line per-stage summary (cheap to print, doesn't burn log budget).
+        logger.info(
+            f"[val] batches={num_batches} "
+            f"total={avg_losses['val_loss_total']:.4f} "
+            f"stage1={avg_losses['val_loss_s1_teacher']:.4f} "
+            f"stage2={avg_losses['val_loss_s2_gt']:.4f} "
+            f"stage3={avg_losses['val_loss_s3_gt']:.4f} "
+            f"stage4={avg_losses['val_loss_s4_gt']:.4f}"
+        )
 
         return avg_losses
 
@@ -357,9 +388,10 @@ def train_phase1(
     config: Dict[str, Any],
     checkpoint_dir: Optional[Path] = None,
     num_epochs: Optional[int] = None,
+    log_every: Optional[int] = None,
 ) -> Tuple[BudgetAdaptiveDecoder, Dict]:
     """
-    Run Phase 1 training.
+    Run Phase 1 training with Kaggle-friendly low-volume logging.
 
     Args:
         decoder: BudgetAdaptiveDecoder (student)
@@ -371,6 +403,7 @@ def train_phase1(
         config: Training configuration dict
         checkpoint_dir: Directory for checkpoints
         num_epochs: Number of epochs (default from config)
+        log_every: Per-batch log cadence (default 500, set 0 to disable)
 
     Returns:
         Tuple of (trained_decoder, final_metrics)
@@ -384,24 +417,32 @@ def train_phase1(
         device=device,
         config=config,
         checkpoint_dir=checkpoint_dir,
+        log_every=log_every,
     )
 
-    logger.info(f"Starting Phase 1 training for {num_epochs} epochs")
+    n_train_batches = len(train_loader)
+    log_every_str = (
+        f"{trainer.log_every} batches" if trainer.log_every > 0 else "off"
+    )
+    logger.info(
+        f"Starting Phase 1 training for {num_epochs} epochs "
+        f"({n_train_batches} train batches; per-batch logs every {log_every_str})"
+    )
 
     for epoch in range(1, num_epochs + 1):
         train_metrics = trainer.train_epoch(train_loader, epoch)
         val_metrics = trainer.validate(val_loader)
 
+        # Compact single-line per-epoch summary. Replaces the previous two-line
+        # dump; keeps per-stage metrics on the same line.
         logger.info(
-            f"Epoch {epoch}: "
-            f"Train Loss = {train_metrics['loss_total']:.6f}, "
-            f"Val Loss = {val_metrics['val_loss_total']:.6f}"
-        )
-        logger.info(
-            f"  S1 (teacher): {train_metrics['loss_s1_teacher']:.6f} | "
-            f"S2 (GT): {train_metrics['loss_s2_gt']:.6f} | "
-            f"S3 (GT): {train_metrics['loss_s3_gt']:.6f} | "
-            f"S4 (GT): {train_metrics['loss_s4_gt']:.6f}"
+            f"[epoch {epoch}/{num_epochs} done] "
+            f"train_total={train_metrics['loss_total']:.6f} "
+            f"S1_T={train_metrics['loss_s1_teacher']:.6f} "
+            f"S2={train_metrics['loss_s2_gt']:.6f} "
+            f"S3={train_metrics['loss_s3_gt']:.6f} "
+            f"S4={train_metrics['loss_s4_gt']:.6f} "
+            f"| val_total={val_metrics['val_loss_total']:.6f}"
         )
 
         if trainer.should_stop_early(val_metrics['val_loss_total']):
