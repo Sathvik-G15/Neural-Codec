@@ -526,7 +526,7 @@ def main_entry():
         print(f"  Resumed decoder weights from {args.resume}")
 
     print(f"\n[Data] loading Vimeo90k from {args.data_root}")
-    from ..data.vimeo90k import Vimeo90kDataset
+    from budget_adaptive_decoder.data.vimeo90k import Vimeo90kDataset
     train_loader, val_loader = _build_kaggle_loaders(args, Vimeo90kDataset)
 
     optimizer = torch.optim.Adam(decoder.parameters(), lr=args.lr)
