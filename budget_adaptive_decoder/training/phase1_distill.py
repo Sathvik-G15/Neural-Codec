@@ -26,6 +26,7 @@ CLI Usage (Kaggle)
 import argparse
 import os
 import random
+import time
 
 import torch
 import torch.nn.functional as F
@@ -43,6 +44,22 @@ logger = logging.getLogger(__name__)
 
 # Stage weights for ground truth supervision (stages 2, 3, 4)
 GT_WEIGHTS = {2: 0.5, 3: 0.75, 4: 1.0}
+
+
+# Maximum wall-clock training time. The script gracefully stops and saves a
+# checkpoint once this budget is exceeded (Kaggle's session limit is 12h).
+MAX_TRAINING_SECONDS = 12 * 60 * 60
+
+
+# Cadence for periodic side-disk checkpoints. We overwrite the SAME file every
+# time so that disk usage stays bounded.
+CHECKPOINT_CADENCE_BATCHES = 500
+SIDE_CKPT_FILENAME = "phase1_latest.pt"
+
+
+# Cadence for in-loop progress logs (per-batch). One line every N batches to
+# respect Kaggle's 20MB log cap.
+LOG_CADENCE_BATCHES = 1000
 
 
 # Middle frame of the septuplet matches the Phase 2 / Phase 4 indexing.
@@ -99,6 +116,8 @@ class Phase1Trainer:
         config: Dict[str, Any],
         checkpoint_dir: Optional[Path] = None,
         log_every: Optional[int] = None,
+        ckpt_every_batches: Optional[int] = None,
+        max_training_seconds: Optional[float] = None,
     ):
         """
         Args:
@@ -108,9 +127,14 @@ class Phase1Trainer:
             device: Device to train on
             config: Training configuration dict
             checkpoint_dir: Directory to save checkpoints
-            log_every: Print a training log line every N batches (default 500).
+            log_every: Print a training log line every N batches (default 1000).
                        Set to 0 or None to disable mid-epoch logging (will only log
                        per-epoch + validation summary).
+            ckpt_every_batches: Save a "latest" checkpoint every N batches,
+                       overwriting the previous one (default 500). Set 0 to disable.
+            max_training_seconds: Hard wall-clock time budget. Training is stopped
+                       (with a final checkpoint) once the budget is exhausted.
+                       Default = 12 hours.
         """
         self.decoder = decoder
         self.teacher = teacher
@@ -128,12 +152,30 @@ class Phase1Trainer:
         self.best_loss = float("inf")
         self.wait = 0
 
-        # Logging cadence: per-batch logs balloon Kaggle's 20MB log limit.
-        # Default to 500 batches; user-configurable via --log_every or config.
+        # Per-batch logging cadence. Default to 1000 to keep the log under
+        # Kaggle's 20MB cap; user-configurable via --log_every or config.
         if log_every is None:
-            log_every = int(config.get("log_every", 500))
+            log_every = int(config.get("log_every", LOG_CADENCE_BATCHES))
         self.log_every = max(int(log_every), 0)
         self._tqdm_disabled = True  # we never use tqdm in this trainer
+
+        # Side checkpoint cadence: every N batches we save and OVERWRITE the
+        # same "latest" file to keep disk usage bounded.
+        if ckpt_every_batches is None:
+            ckpt_every_batches = int(
+                config.get("ckpt_every_batches", CHECKPOINT_CADENCE_BATCHES)
+            )
+        self.ckpt_every_batches = max(int(ckpt_every_batches), 0)
+        self.side_ckpt_path = self.checkpoint_dir / SIDE_CKPT_FILENAME
+
+        # Wall-clock budget. Kaggle sessions terminate at ~12h, so default to
+        # that ceiling. The trainer stops as soon as the budget is hit.
+        if max_training_seconds is None:
+            max_training_seconds = float(
+                config.get("max_training_seconds", MAX_TRAINING_SECONDS)
+            )
+        self.max_training_seconds = float(max_training_seconds)
+        self.train_start_time = time.time()
 
         self.loss_history = []
         self.val_loss_history = []
@@ -200,9 +242,18 @@ class Phase1Trainer:
         self,
         train_loader: DataLoader,
         epoch: int,
-    ) -> Dict[str, float]:
+    ) -> Tuple[Dict[str, float], bool]:
         """
         Train for one epoch.
+
+        Side effects:
+          * Prints a one-line training log every `self.log_every` batches
+            (default 1000) to stay under Kaggle's 20MB log cap.
+          * Saves a "latest" checkpoint (overwriting the same file) every
+            `self.ckpt_every_batches` batches (default 500).
+          * Stops early if the wall-clock budget (`self.max_training_seconds`,
+            default 12h) is exhausted. The flag returned in the second tuple
+            element signals the caller to break out of the outer epoch loop.
 
         Args:
             train_loader: DataLoader yielding either:
@@ -217,7 +268,7 @@ class Phase1Trainer:
             epoch: Current epoch number
 
         Returns:
-            Dictionary of loss metrics
+            (avg_losses, time_budget_exceeded)
         """
         self.decoder.train()
         epoch_losses = {
@@ -231,6 +282,8 @@ class Phase1Trainer:
         # Discard per-step totals to avoid Python int accumulation overhead.
         # We only emit a log every `log_every` batches.
         log_every = self.log_every
+        ckpt_every = self.ckpt_every_batches
+        time_budget_exceeded = False
 
         for batch_idx, batch in enumerate(train_loader, start=1):
             curr_frame, ref_frame = _unpack_batch(batch)
@@ -270,10 +323,36 @@ class Phase1Trainer:
             # string. We only build/print a log line every `log_every` batches.
             if log_every > 0 and (batch_idx % log_every == 0):
                 running_loss = epoch_losses['loss_total'] / batch_idx
+                elapsed_s = time.time() - self.train_start_time
                 logger.info(
                     f"[trn] ep={epoch} step={batch_idx}/{len(train_loader)} "
-                    f"avg_loss={running_loss:.6f} step_loss={loss.item():.6f}"
+                    f"avg_loss={running_loss:.6f} step_loss={loss.item():.6f} "
+                    f"elapsed={elapsed_s/3600:.2f}h"
                 )
+
+            # Periodic side checkpoint: overwrite a SINGLE file every
+            # `ckpt_every_batches` batches. Keep only this latest snapshot on
+            # disk to honour the user's space constraint.
+            if ckpt_every > 0 and (batch_idx % ckpt_every == 0):
+                self.save_latest_batch_checkpoint(
+                    epoch=epoch,
+                    global_batch_idx=batch_idx,
+                    extra={"running_avg_loss": epoch_losses['loss_total'] / batch_idx},
+                )
+
+            # Wall-clock budget check. Bail out as soon as the ceiling is hit;
+            # the caller will save a final checkpoint and exit.
+            if self.max_training_seconds > 0:
+                elapsed = time.time() - self.train_start_time
+                if elapsed >= self.max_training_seconds:
+                    remaining = max(self.max_training_seconds - elapsed, 0)
+                    logger.warning(
+                        f"[time-budget] reached {self.max_training_seconds}s "
+                        f"(elapsed={elapsed/3600:.2f}h, remaining={remaining:.1f}s); "
+                        f"stopping at ep={epoch} step={batch_idx}"
+                    )
+                    time_budget_exceeded = True
+                    break
 
         # Average losses
         avg_losses = {k: v / max(num_batches, 1) for k, v in epoch_losses.items()}
@@ -281,7 +360,7 @@ class Phase1Trainer:
 
         self.loss_history.append(avg_losses)
 
-        return avg_losses
+        return avg_losses, time_budget_exceeded
 
     @torch.no_grad()
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
@@ -369,6 +448,34 @@ class Phase1Trainer:
 
         logger.info(f"Checkpoint saved: {checkpoint_path}")
 
+    def save_latest_batch_checkpoint(
+        self,
+        epoch: int,
+        global_batch_idx: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        """Save (and overwrite) the single "latest" side checkpoint.
+
+        A space-constrained fallback that is independent of the regular
+        per-epoch checkpoint cadence. Always writes to the same file so disk
+        usage stays bounded.
+        """
+        extra = extra or {}
+        torch.save({
+            "epoch": epoch,
+            "global_batch_idx": global_batch_idx,
+            "decoder_state_dict": self.decoder.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "best_loss": self.best_loss,
+            "extra": extra,
+            "elapsed_seconds": time.time() - self.train_start_time,
+        }, self.side_ckpt_path)
+        logger.info(
+            f"[side-ckpt] ep={epoch} batch={global_batch_idx} -> "
+            f"{self.side_ckpt_path.name}"
+        )
+        return self.side_ckpt_path
+
     def load_checkpoint(self, checkpoint_path: Path):
         """Load a training checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -388,7 +495,9 @@ def train_phase1(
     config: Dict[str, Any],
     checkpoint_dir: Optional[Path] = None,
     num_epochs: Optional[int] = None,
-    log_every: Optional[int] = None,
+    log_every: Optional[int] = 1000,
+    ckpt_every_batches: Optional[int] = 500,
+    max_training_seconds: Optional[float] = 12 * 60 * 60,
 ) -> Tuple[BudgetAdaptiveDecoder, Dict]:
     """
     Run Phase 1 training with Kaggle-friendly low-volume logging.
@@ -403,7 +512,11 @@ def train_phase1(
         config: Training configuration dict
         checkpoint_dir: Directory for checkpoints
         num_epochs: Number of epochs (default from config)
-        log_every: Per-batch log cadence (default 500, set 0 to disable)
+        log_every: Per-batch log cadence (default 1000, set 0 to disable)
+        ckpt_every_batches: Overwrite the "latest" checkpoint every N batches
+            (default 500). Set to 0 to disable in-loop checkpoints.
+        max_training_seconds: Hard wall-clock budget (default 12h). Training
+            stops and saves a final checkpoint once reached.
 
     Returns:
         Tuple of (trained_decoder, final_metrics)
@@ -418,6 +531,8 @@ def train_phase1(
         config=config,
         checkpoint_dir=checkpoint_dir,
         log_every=log_every,
+        ckpt_every_batches=ckpt_every_batches,
+        max_training_seconds=max_training_seconds,
     )
 
     n_train_batches = len(train_loader)
@@ -426,15 +541,37 @@ def train_phase1(
     )
     logger.info(
         f"Starting Phase 1 training for {num_epochs} epochs "
-        f"({n_train_batches} train batches; per-batch logs every {log_every_str})"
+        f"({n_train_batches} train batches; logs every {log_every_str}; "
+        f"side-ckpt every {trainer.ckpt_every_batches} batches; "
+        f"time budget {trainer.max_training_seconds/3600:.2f}h)"
     )
 
+    time_budget_hit = False
     for epoch in range(1, num_epochs + 1):
-        train_metrics = trainer.train_epoch(train_loader, epoch)
+        train_metrics, time_budget_hit = trainer.train_epoch(train_loader, epoch)
+
+        if time_budget_hit:
+            # Skip validation once we are out of wall-clock budget; just persist.
+            val_metrics = {"val_loss_total": float("nan")}
+            logger.warning(
+                f"[time-budget] exit at ep={epoch}; saving final checkpoint "
+                f"without validation"
+            )
+            trainer.save_checkpoint(
+                epoch, {**train_metrics, **val_metrics}, is_final=True
+            )
+            trainer.save_latest_batch_checkpoint(
+                epoch=epoch,
+                global_batch_idx=-1,
+                extra={"reason": "time-budget-exceeded"},
+            )
+            break
+
         val_metrics = trainer.validate(val_loader)
 
         # Compact single-line per-epoch summary. Replaces the previous two-line
         # dump; keeps per-stage metrics on the same line.
+        elapsed_h = (time.time() - trainer.train_start_time) / 3600.0
         logger.info(
             f"[epoch {epoch}/{num_epochs} done] "
             f"train_total={train_metrics['loss_total']:.6f} "
@@ -442,21 +579,40 @@ def train_phase1(
             f"S2={train_metrics['loss_s2_gt']:.6f} "
             f"S3={train_metrics['loss_s3_gt']:.6f} "
             f"S4={train_metrics['loss_s4_gt']:.6f} "
-            f"| val_total={val_metrics['val_loss_total']:.6f}"
+            f"| val_total={val_metrics['val_loss_total']:.6f} "
+            f"elapsed={elapsed_h:.2f}h"
         )
 
         if trainer.should_stop_early(val_metrics['val_loss_total']):
             logger.info(f"Early stopping at epoch {epoch}")
+            trainer.save_checkpoint(
+                epoch, {**train_metrics, **val_metrics}, is_final=True
+            )
             break
 
         if epoch % config.get("save_every", 10) == 0:
             trainer.save_checkpoint(epoch, {**train_metrics, **val_metrics})
 
-    trainer.save_checkpoint(epoch, {**train_metrics, **val_metrics}, is_final=True)
+        # Catch the time budget between epochs too in case the last in-loop
+        # batch overshot (cheap, single time check).
+        if trainer.max_training_seconds > 0 and (
+            time.time() - trainer.train_start_time >= trainer.max_training_seconds
+        ):
+            logger.warning("[time-budget] reached between epochs; stopping")
+            trainer.save_checkpoint(
+                epoch, {**train_metrics, **val_metrics}, is_final=True
+            )
+            break
+
+    if not time_budget_hit:
+        trainer.save_checkpoint(epoch, {**train_metrics, **val_metrics}, is_final=True)
 
     return decoder, {
         "final_train_loss": train_metrics['loss_total'],
-        "final_val_loss": val_metrics['val_loss_total'],
+        "final_val_loss": val_metrics.get('val_loss_total', float("nan")),
+        "stopped_reason": (
+            "time-budget-exceeded" if time_budget_hit else "completed"
+        ),
     }
 
 
@@ -517,6 +673,14 @@ def _parse_args():
     p.add_argument("--num_workers", type=int, default=2)
     p.add_argument("--save_every", type=int, default=1)
     p.add_argument("--seed", type=int, default=1234)
+    p.add_argument("--log_every", type=int, default=1000,
+                   help="Emit a training log line every N batches (default 1000).")
+    p.add_argument("--ckpt_every_batches", type=int, default=500,
+                   help="Overwrite the 'latest' side checkpoint every N batches "
+                        "(default 500). Set 0 to disable.")
+    p.add_argument("--max_hours", type=float, default=12.0,
+                   help="Wall-clock training budget in hours (default 12). "
+                        "Training stops and saves a final checkpoint when reached.")
     p.add_argument("--dcvc_src", default=None,
                    help="Directory with DCVC's src/ importable tree; "
                         "defaults to env DCVC_SRC_PATH or local default.")
@@ -594,6 +758,9 @@ def main_entry():
         config=config,
         checkpoint_dir=Path(args.output_dir),
         num_epochs=args.epochs,
+        log_every=args.log_every,
+        ckpt_every_batches=args.ckpt_every_batches,
+        max_training_seconds=args.max_hours * 3600.0,
     )
 
     print(f"\nDone. Final metrics: {final_metrics}")

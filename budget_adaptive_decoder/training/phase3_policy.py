@@ -17,8 +17,7 @@ from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 import logging
-from tqdm import tqdm
-import numpy as np
+import time
 
 from ..models.policy import PolicyNetwork
 from ..models.extractor import BitstreamContentExtractor
@@ -28,6 +27,21 @@ from .budget_sampler import MixtureBudgetSampler
 
 
 logger = logging.getLogger(__name__)
+
+
+# Maximum wall-clock training time. The script gracefully stops and saves a
+# checkpoint once this budget is exceeded (Kaggle's session limit is 12h).
+MAX_TRAINING_SECONDS = 12 * 60 * 60
+
+
+# Side checkpoint cadence. We overwrite the SAME file every time so that disk
+# usage stays bounded.
+CHECKPOINT_CADENCE_BATCHES = 500
+SIDE_CKPT_FILENAME = "phase3_latest.pt"
+
+
+# In-loop per-batch log cadence (one line every N batches).
+LOG_CADENCE_BATCHES = 1000
 
 
 class Phase3Trainer:
@@ -56,6 +70,9 @@ class Phase3Trainer:
         teacher: Optional[Any] = None,
         delta_q_targets: Optional[Dict[str, torch.Tensor]] = None,
         checkpoint_dir: Optional[Path] = None,
+        log_every: Optional[int] = None,
+        ckpt_every_batches: Optional[int] = None,
+        max_training_seconds: Optional[float] = None,
     ):
         """
         Args:
@@ -68,6 +85,10 @@ class Phase3Trainer:
             teacher: Frozen DCVC teacher for context generation (optional)
             delta_q_targets: Precomputed ΔQ targets from Phase 2
             checkpoint_dir: Directory to save checkpoints
+            log_every: Per-batch log cadence (default 1000, set 0 to disable)
+            ckpt_every_batches: Overwrite the "latest" side checkpoint every N
+                batches (default 500). Set 0 to disable.
+            max_training_seconds: Hard wall-clock budget (default 12h).
         """
         self.policy = policy
         self.extractor = extractor
@@ -96,6 +117,29 @@ class Phase3Trainer:
         self.min_delta = config.get("min_delta", 0.001)
 
         self.trainable_params = list(self.policy.parameters()) + list(self.extractor.parameters())
+
+        # In-loop per-batch logging cadence (default 1000). tqdm is removed to
+        # avoid per-batch stdout spam and to keep us in control of the cadence.
+        if log_every is None:
+            log_every = int(config.get("log_every", LOG_CADENCE_BATCHES))
+        self.log_every = max(int(log_every), 0)
+
+        # Side checkpoint cadence (overwrite the same file every N batches).
+        if ckpt_every_batches is None:
+            ckpt_every_batches = int(
+                config.get("ckpt_every_batches", CHECKPOINT_CADENCE_BATCHES)
+            )
+        self.ckpt_every_batches = max(int(ckpt_every_batches), 0)
+        self.side_ckpt_path = self.checkpoint_dir / SIDE_CKPT_FILENAME
+
+        # Wall-clock budget. Kaggle sessions terminate at ~12h, so default to
+        # that ceiling unless overridden.
+        if max_training_seconds is None:
+            max_training_seconds = float(
+                config.get("max_training_seconds", MAX_TRAINING_SECONDS)
+            )
+        self.max_training_seconds = float(max_training_seconds)
+        self.train_start_time = time.time()
 
     def sample_budget(self, batch_size: int) -> torch.Tensor:
         """Sample budget from mixture distribution (Issue 3.3 fix).
@@ -193,26 +237,38 @@ class Phase3Trainer:
         self,
         train_loader: DataLoader,
         epoch: int,
-    ) -> Dict[str, float]:
+    ) -> Tuple[Dict[str, float], bool]:
         """
         Train for one epoch.
+
+        Side effects:
+          * Prints a one-line training log every `self.log_every` batches
+            (default 1000) to stay under Kaggle's 20MB log cap.
+          * Saves a "latest" side checkpoint (overwriting the same file) every
+            `self.ckpt_every_batches` batches (default 500).
+          * Stops early if the wall-clock budget (`self.max_training_seconds`,
+            default 12h) is exhausted. The flag returned in the second tuple
+            element signals the caller to break out of the outer epoch loop.
 
         Args:
             train_loader: Training data loader
             epoch: Current epoch number
 
         Returns:
-            Dictionary of loss metrics
+            (metrics_dict, time_budget_exceeded)
         """
         self.policy.train()
         self.extractor.train()
 
         total_loss = 0.0
         num_batches = 0
+        log_every = self.log_every
+        ckpt_every = self.ckpt_every_batches
+        time_budget_exceeded = False
 
-        pbar = tqdm(train_loader, desc=f"Phase 3 Epoch {epoch}")
-
-        for batch_idx, (frames, bitstream_dict, prev_frame) in enumerate(pbar):
+        for batch_idx, (frames, bitstream_dict, prev_frame) in enumerate(
+            train_loader, start=1
+        ):
             curr_frame = frames[:, 3].to(self.device)
             latent = bitstream_dict["latent"].to(self.device)
             prev_frame = prev_frame.to(self.device)
@@ -238,15 +294,41 @@ class Phase3Trainer:
             total_loss += loss.item()
             num_batches += 1
 
-            pbar.set_postfix({
-                "loss": loss.item(),
-                "ΔQ_pred_mean": delta_q_pred.mean().item(),
-                "ΔQ_target_mean": delta_q_target.mean().item(),
-            })
+            if log_every > 0 and (batch_idx % log_every == 0):
+                running_loss = total_loss / batch_idx
+                elapsed_s = time.time() - self.train_start_time
+                logger.info(
+                    f"[phase3 trn] ep={epoch} step={batch_idx}/"
+                    f"{len(train_loader)} avg_loss={running_loss:.6f} "
+                    f"step_loss={loss.item():.6f} "
+                    f"dQ_pred={delta_q_pred.mean().item():.4f} "
+                    f"dQ_tgt={delta_q_target.mean().item():.4f} "
+                    f"elapsed={elapsed_s/3600:.2f}h"
+                )
+
+            if ckpt_every > 0 and (batch_idx % ckpt_every == 0):
+                self.save_latest_batch_checkpoint(
+                    epoch=epoch,
+                    global_batch_idx=batch_idx,
+                    extra={"running_avg_loss": total_loss / batch_idx},
+                )
+
+            if self.max_training_seconds > 0:
+                elapsed = time.time() - self.train_start_time
+                if elapsed >= self.max_training_seconds:
+                    remaining = max(self.max_training_seconds - elapsed, 0)
+                    logger.warning(
+                        f"[phase3 time-budget] reached "
+                        f"{self.max_training_seconds}s (elapsed="
+                        f"{elapsed/3600:.2f}h, remaining={remaining:.1f}s); "
+                        f"stopping at ep={epoch} step={batch_idx}"
+                    )
+                    time_budget_exceeded = True
+                    break
 
         avg_loss = total_loss / max(num_batches, 1)
 
-        return {"loss": avg_loss}
+        return {"loss": avg_loss}, time_budget_exceeded
 
     @torch.no_grad()
     def validate(
@@ -316,6 +398,29 @@ class Phase3Trainer:
 
         logger.info(f"Checkpoint saved: {checkpoint_path}")
 
+    def save_latest_batch_checkpoint(
+        self,
+        epoch: int,
+        global_batch_idx: int,
+        extra: Optional[Dict[str, Any]] = None,
+    ) -> Path:
+        """Save (and overwrite) the single "latest" side checkpoint."""
+        extra = extra or {}
+        torch.save({
+            "epoch": epoch,
+            "global_batch_idx": global_batch_idx,
+            "policy_state_dict": self.policy.state_dict(),
+            "extractor_state_dict": self.extractor.state_dict(),
+            "optimizer_state_dict": self.optimizer.state_dict(),
+            "extra": extra,
+            "elapsed_seconds": time.time() - self.train_start_time,
+        }, self.side_ckpt_path)
+        logger.info(
+            f"[phase3 side-ckpt] ep={epoch} batch={global_batch_idx} -> "
+            f"{self.side_ckpt_path.name}"
+        )
+        return self.side_ckpt_path
+
     def load_checkpoint(self, checkpoint_path: Path):
         """Load a training checkpoint."""
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -363,6 +468,9 @@ def train_phase3(
     delta_q_targets: Optional[Dict[str, torch.Tensor]] = None,
     checkpoint_dir: Optional[Path] = None,
     num_epochs: Optional[int] = None,
+    log_every: Optional[int] = 1000,
+    ckpt_every_batches: Optional[int] = 500,
+    max_training_seconds: Optional[float] = 12 * 60 * 60,
 ) -> Tuple[PolicyNetwork, BitstreamContentExtractor, Dict]:
     """
     Main Phase 3 training loop.
@@ -380,6 +488,10 @@ def train_phase3(
         delta_q_targets: Precomputed ΔQ targets from Phase 2
         checkpoint_dir: Directory for checkpoints
         num_epochs: Number of epochs (default from config)
+        log_every: Per-batch log cadence (default 1000, set 0 to disable)
+        ckpt_every_batches: Overwrite the "latest" side checkpoint every N
+            batches (default 500). Set 0 to disable.
+        max_training_seconds: Hard wall-clock budget (default 12h).
 
     Returns:
         Tuple of (trained_policy, trained_extractor, final_metrics)
@@ -396,32 +508,76 @@ def train_phase3(
         teacher=teacher,
         delta_q_targets=delta_q_targets,
         checkpoint_dir=checkpoint_dir,
+        log_every=log_every,
+        ckpt_every_batches=ckpt_every_batches,
+        max_training_seconds=max_training_seconds,
     )
 
-    logger.info(f"Starting Phase 3 training for {num_epochs} epochs")
+    logger.info(
+        f"Starting Phase 3 training for {num_epochs} epochs "
+        f"(logs every {trainer.log_every} batches; side-ckpt every "
+        f"{trainer.ckpt_every_batches} batches; time budget "
+        f"{trainer.max_training_seconds/3600:.2f}h)"
+    )
 
+    time_budget_hit = False
     for epoch in range(1, num_epochs + 1):
-        train_metrics = trainer.train_epoch(train_loader, epoch)
+        train_metrics, time_budget_hit = trainer.train_epoch(train_loader, epoch)
+
+        if time_budget_hit:
+            val_metrics = {"val_loss": float("nan")}
+            logger.warning(
+                f"[phase3 time-budget] exit at ep={epoch}; saving final "
+                f"checkpoint without validation"
+            )
+            trainer.save_checkpoint(
+                epoch, {**train_metrics, **val_metrics}, is_final=True
+            )
+            trainer.save_latest_batch_checkpoint(
+                epoch=epoch,
+                global_batch_idx=-1,
+                extra={"reason": "time-budget-exceeded"},
+            )
+            break
+
         val_metrics = trainer.validate(val_loader)
 
+        elapsed_h = (time.time() - trainer.train_start_time) / 3600.0
         logger.info(
             f"Epoch {epoch}: "
             f"Train Loss = {train_metrics['loss']:.6f}, "
-            f"Val Loss = {val_metrics['val_loss']:.6f}"
+            f"Val Loss = {val_metrics['val_loss']:.6f} "
+            f"elapsed={elapsed_h:.2f}h"
         )
 
         if trainer.should_stop_early(val_metrics["val_loss"]):
             logger.info(f"Early stopping at epoch {epoch}")
+            trainer.save_checkpoint(
+                epoch, {**train_metrics, **val_metrics}, is_final=True
+            )
             break
 
         if epoch % config.get("save_every", 10) == 0:
             trainer.save_checkpoint(epoch, {**train_metrics, **val_metrics})
 
-    trainer.save_checkpoint(epoch, {**train_metrics, **val_metrics}, is_final=True)
+        if trainer.max_training_seconds > 0 and (
+            time.time() - trainer.train_start_time >= trainer.max_training_seconds
+        ):
+            logger.warning("[phase3 time-budget] reached between epochs; stopping")
+            trainer.save_checkpoint(
+                epoch, {**train_metrics, **val_metrics}, is_final=True
+            )
+            break
+
+    if not time_budget_hit:
+        trainer.save_checkpoint(epoch, {**train_metrics, **val_metrics}, is_final=True)
 
     return policy, extractor, {
         "final_train_loss": train_metrics["loss"],
-        "final_val_loss": val_metrics["val_loss"],
+        "final_val_loss": val_metrics.get("val_loss", float("nan")),
+        "stopped_reason": (
+            "time-budget-exceeded" if time_budget_hit else "completed"
+        ),
     }
 
 
