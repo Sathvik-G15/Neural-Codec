@@ -26,6 +26,7 @@ CLI Usage (Kaggle)
 import argparse
 import os
 import random
+import sys
 import time
 
 import torch
@@ -33,13 +34,13 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-import logging
 
 from ..models.decoder import BudgetAdaptiveDecoder
 from ..models.teacher import DCVCWrapper
 
 
-logger = logging.getLogger(__name__)
+def _log(msg, *, err=False):
+    print(msg, file=sys.stderr if err else sys.stdout, flush=True)
 
 
 # Stage weights for ground truth supervision (stages 2, 3, 4)
@@ -189,7 +190,7 @@ class Phase1Trainer:
                     f"Teacher has {trainable_params} trainable parameters. "
                     "Teacher must be frozen during Phase 1 distillation."
                 )
-        logger.info("Teacher verification passed: all parameters frozen")
+        _log("Teacher verification passed: all parameters frozen")
 
     def compute_phase1_loss(
         self,
@@ -324,7 +325,7 @@ class Phase1Trainer:
             if log_every > 0 and (batch_idx % log_every == 0):
                 running_loss = epoch_losses['loss_total'] / batch_idx
                 elapsed_s = time.time() - self.train_start_time
-                logger.info(
+                _log(
                     f"[trn] ep={epoch} step={batch_idx}/{len(train_loader)} "
                     f"avg_loss={running_loss:.6f} step_loss={loss.item():.6f} "
                     f"elapsed={elapsed_s/3600:.2f}h"
@@ -346,10 +347,11 @@ class Phase1Trainer:
                 elapsed = time.time() - self.train_start_time
                 if elapsed >= self.max_training_seconds:
                     remaining = max(self.max_training_seconds - elapsed, 0)
-                    logger.warning(
+                    _log(
                         f"[time-budget] reached {self.max_training_seconds}s "
                         f"(elapsed={elapsed/3600:.2f}h, remaining={remaining:.1f}s); "
-                        f"stopping at ep={epoch} step={batch_idx}"
+                        f"stopping at ep={epoch} step={batch_idx}",
+                        err=True,
                     )
                     time_budget_exceeded = True
                     break
@@ -410,7 +412,7 @@ class Phase1Trainer:
         self.val_loss_history.append(avg_losses)
 
         # Single-line per-stage summary (cheap to print, doesn't burn log budget).
-        logger.info(
+        _log(
             f"[val] batches={num_batches} "
             f"total={avg_losses['val_loss_total']:.4f} "
             f"stage1={avg_losses['val_loss_s1_teacher']:.4f} "
@@ -429,7 +431,7 @@ class Phase1Trainer:
         else:
             self.wait += 1
             if self.wait >= self.patience:
-                logger.info(f"Early stopping triggered after {self.wait} epochs without improvement")
+                _log(f"Early stopping triggered after {self.wait} epochs without improvement")
                 return True
         return False
 
@@ -446,7 +448,7 @@ class Phase1Trainer:
             "best_loss": self.best_loss,
         }, checkpoint_path)
 
-        logger.info(f"Checkpoint saved: {checkpoint_path}")
+        _log(f"Checkpoint saved: {checkpoint_path}")
 
     def save_latest_batch_checkpoint(
         self,
@@ -470,7 +472,7 @@ class Phase1Trainer:
             "extra": extra,
             "elapsed_seconds": time.time() - self.train_start_time,
         }, self.side_ckpt_path)
-        logger.info(
+        _log(
             f"[side-ckpt] ep={epoch} batch={global_batch_idx} -> "
             f"{self.side_ckpt_path.name}"
         )
@@ -539,7 +541,7 @@ def train_phase1(
     log_every_str = (
         f"{trainer.log_every} batches" if trainer.log_every > 0 else "off"
     )
-    logger.info(
+    _log(
         f"Starting Phase 1 training for {num_epochs} epochs "
         f"({n_train_batches} train batches; logs every {log_every_str}; "
         f"side-ckpt every {trainer.ckpt_every_batches} batches; "
@@ -553,9 +555,10 @@ def train_phase1(
         if time_budget_hit:
             # Skip validation once we are out of wall-clock budget; just persist.
             val_metrics = {"val_loss_total": float("nan")}
-            logger.warning(
+            _log(
                 f"[time-budget] exit at ep={epoch}; saving final checkpoint "
-                f"without validation"
+                f"without validation",
+                err=True,
             )
             trainer.save_checkpoint(
                 epoch, {**train_metrics, **val_metrics}, is_final=True
@@ -572,7 +575,7 @@ def train_phase1(
         # Compact single-line per-epoch summary. Replaces the previous two-line
         # dump; keeps per-stage metrics on the same line.
         elapsed_h = (time.time() - trainer.train_start_time) / 3600.0
-        logger.info(
+        _log(
             f"[epoch {epoch}/{num_epochs} done] "
             f"train_total={train_metrics['loss_total']:.6f} "
             f"S1_T={train_metrics['loss_s1_teacher']:.6f} "
@@ -584,7 +587,7 @@ def train_phase1(
         )
 
         if trainer.should_stop_early(val_metrics['val_loss_total']):
-            logger.info(f"Early stopping at epoch {epoch}")
+            _log(f"Early stopping at epoch {epoch}")
             trainer.save_checkpoint(
                 epoch, {**train_metrics, **val_metrics}, is_final=True
             )
@@ -598,7 +601,7 @@ def train_phase1(
         if trainer.max_training_seconds > 0 and (
             time.time() - trainer.train_start_time >= trainer.max_training_seconds
         ):
-            logger.warning("[time-budget] reached between epochs; stopping")
+            _log("[time-budget] reached between epochs; stopping", err=True)
             trainer.save_checkpoint(
                 epoch, {**train_metrics, **val_metrics}, is_final=True
             )

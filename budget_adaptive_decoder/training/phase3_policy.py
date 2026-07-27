@@ -11,12 +11,12 @@ Key requirements:
 - Policy Network + BitstreamContentExtractor trainable, decoder frozen
 """
 
+import sys
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
-import logging
 import time
 
 from ..models.policy import PolicyNetwork
@@ -26,7 +26,8 @@ from ..data.augmentation import ReferenceFrameCorruption
 from .budget_sampler import MixtureBudgetSampler
 
 
-logger = logging.getLogger(__name__)
+def _log(msg, *, err=False):
+    print(msg, file=sys.stderr if err else sys.stdout, flush=True)
 
 
 # Maximum wall-clock training time. The script gracefully stops and saves a
@@ -297,7 +298,7 @@ class Phase3Trainer:
             if log_every > 0 and (batch_idx % log_every == 0):
                 running_loss = total_loss / batch_idx
                 elapsed_s = time.time() - self.train_start_time
-                logger.info(
+                _log(
                     f"[phase3 trn] ep={epoch} step={batch_idx}/"
                     f"{len(train_loader)} avg_loss={running_loss:.6f} "
                     f"step_loss={loss.item():.6f} "
@@ -317,11 +318,12 @@ class Phase3Trainer:
                 elapsed = time.time() - self.train_start_time
                 if elapsed >= self.max_training_seconds:
                     remaining = max(self.max_training_seconds - elapsed, 0)
-                    logger.warning(
+                    _log(
                         f"[phase3 time-budget] reached "
                         f"{self.max_training_seconds}s (elapsed="
                         f"{elapsed/3600:.2f}h, remaining={remaining:.1f}s); "
-                        f"stopping at ep={epoch} step={batch_idx}"
+                        f"stopping at ep={epoch} step={batch_idx}",
+                        err=True,
                     )
                     time_budget_exceeded = True
                     break
@@ -379,7 +381,7 @@ class Phase3Trainer:
         else:
             self.wait += 1
             if self.wait >= self.patience:
-                logger.info(f"Early stopping triggered after {self.wait} epochs without improvement")
+                _log(f"Early stopping triggered after {self.wait} epochs without improvement")
                 return True
         return False
 
@@ -396,7 +398,7 @@ class Phase3Trainer:
             "metrics": metrics,
         }, checkpoint_path)
 
-        logger.info(f"Checkpoint saved: {checkpoint_path}")
+        _log(f"Checkpoint saved: {checkpoint_path}")
 
     def save_latest_batch_checkpoint(
         self,
@@ -415,7 +417,7 @@ class Phase3Trainer:
             "extra": extra,
             "elapsed_seconds": time.time() - self.train_start_time,
         }, self.side_ckpt_path)
-        logger.info(
+        _log(
             f"[phase3 side-ckpt] ep={epoch} batch={global_batch_idx} -> "
             f"{self.side_ckpt_path.name}"
         )
@@ -513,7 +515,7 @@ def train_phase3(
         max_training_seconds=max_training_seconds,
     )
 
-    logger.info(
+    _log(
         f"Starting Phase 3 training for {num_epochs} epochs "
         f"(logs every {trainer.log_every} batches; side-ckpt every "
         f"{trainer.ckpt_every_batches} batches; time budget "
@@ -526,9 +528,10 @@ def train_phase3(
 
         if time_budget_hit:
             val_metrics = {"val_loss": float("nan")}
-            logger.warning(
+            _log(
                 f"[phase3 time-budget] exit at ep={epoch}; saving final "
-                f"checkpoint without validation"
+                f"checkpoint without validation",
+                err=True,
             )
             trainer.save_checkpoint(
                 epoch, {**train_metrics, **val_metrics}, is_final=True
@@ -543,7 +546,7 @@ def train_phase3(
         val_metrics = trainer.validate(val_loader)
 
         elapsed_h = (time.time() - trainer.train_start_time) / 3600.0
-        logger.info(
+        _log(
             f"Epoch {epoch}: "
             f"Train Loss = {train_metrics['loss']:.6f}, "
             f"Val Loss = {val_metrics['val_loss']:.6f} "
@@ -551,7 +554,7 @@ def train_phase3(
         )
 
         if trainer.should_stop_early(val_metrics["val_loss"]):
-            logger.info(f"Early stopping at epoch {epoch}")
+            _log(f"Early stopping at epoch {epoch}")
             trainer.save_checkpoint(
                 epoch, {**train_metrics, **val_metrics}, is_final=True
             )
@@ -563,7 +566,7 @@ def train_phase3(
         if trainer.max_training_seconds > 0 and (
             time.time() - trainer.train_start_time >= trainer.max_training_seconds
         ):
-            logger.warning("[phase3 time-budget] reached between epochs; stopping")
+            _log("[phase3 time-budget] reached between epochs; stopping", err=True)
             trainer.save_checkpoint(
                 epoch, {**train_metrics, **val_metrics}, is_final=True
             )
